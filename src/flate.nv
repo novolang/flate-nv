@@ -1,0 +1,232 @@
+// flate.nv — the two values every other module in this package takes:
+// which container is wrapped around the DEFLATE stream, and how hard
+// the encoder is asked to work.
+//
+// WHY THE LEVEL IS A VALUE AND NOT AN INTEGER
+//
+// `deflate(data, 6)` is a call nobody can read and everybody can get
+// wrong: 6 is zlib's default, 1 is its fastest, 0 means do not compress
+// at all, and -1 means "the default" in zlib's own C API while meaning
+// "invalid" everywhere else.  A `FlateLevel` is a value with a
+// constructor per intent — `flate.fastest()`, `flate.balanced()`,
+// `flate.smallest()` — and one checked escape, `flate.level(n)`, that
+// returns a `Result` for the caller who genuinely has a number from a
+// config file.  The struct carries the number so an encoder can act on
+// it and `flate.level_number` hands it back for a caller writing it
+// into a gzip XFL byte.
+//
+// WHY THE CONTAINER IS A SEPARATE VALUE FROM THE STREAM
+//
+// DEFLATE (RFC 1951) is a bit stream with no header, no checksum and
+// no length.  zlib (RFC 1950) wraps it in two header bytes and an
+// Adler-32; gzip (RFC 1952) wraps it in a ten-byte-or-longer header
+// and a CRC32 plus a length.  The three share every bit of the
+// compression and none of the framing, so the framing is a parameter:
+// one `Inflater` and one `Deflater`, told which container to expect or
+// emit.  A caller decoding an HTTP `Content-Encoding: deflate` body
+// that turns out to be raw — which happens, because the header is
+// widely mis-set — changes one argument rather than one library.
+//
+// WHAT IS THE SPECIFICATION, AND WHAT IS ZLIB'S CHOICE
+//
+// `FlateFormat` and the trailer rules are RFC 1950 / 1951 / 1952 and
+// binding.  `FlateLevel`'s NUMBERS and `FlateStrategy` are zlib's own
+// choices: nothing in RFC 1951 says a level exists, and a conforming
+// encoder may produce any valid stream at any level.  The README's
+// "What is the specification" section says which is which for the
+// whole package; the levels are here because zlib's numbering is what
+// every caller and every wire format expects.
+
+// Which container the DEFLATE bit stream is wrapped in.
+//
+// The variants are prefixed rather than spelled `Raw`, `Zlib`, `Gzip`
+// because a variant constructor in this language resolves by NAME
+// across the whole assembly, not by the type the expression needs (see
+// the README's naming section), and three words that short would
+// collide with the first package that wanted them.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.format_name(GzipWrapped)}")     // gzip
+// ```
+pub enum FlateFormat
+    // RFC 1951 and nothing else: no header, no checksum, no length.
+    // What a ZIP entry holds, what a PNG `IDAT` does NOT hold (that is
+    // zlib), and what an HTTP `Content-Encoding: deflate` body turns
+    // out to be about half the time.
+    RawDeflate
+    // RFC 1950: a two-byte CMF/FLG header, the DEFLATE stream, and a
+    // four-byte big-endian Adler-32 of the UNCOMPRESSED data.
+    ZlibWrapped
+    // RFC 1952: a header of at least ten bytes with optional name,
+    // comment, extra field and header CRC, the DEFLATE stream, and a
+    // trailer of a four-byte little-endian CRC32 and a four-byte
+    // little-endian length modulo 2^32.
+    GzipWrapped
+
+// The wire name of a container, for a message or a header.
+//
+// `raw`, `zlib`, `gzip` — the spellings HTTP's `Content-Encoding` and
+// every command-line tool use, so a caller can print this straight
+// into a header value or an error.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.format_name(RawDeflate)}")      // raw
+// ```
+pub fn format_name(f: FlateFormat) -> Str
+    todo("flate-nv.format_name")
+
+// How hard the encoder is asked to work: zlib's 0 through 9.
+//
+// A value rather than a bare integer so that a call site says what it
+// means.  The field is public so an encoder can read it and a test can
+// assert on it; it is not the way to BUILD one, because `level` is
+// where the range is checked.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.balanced().number}")            // 6
+// ```
+pub struct FlateLevel
+    // zlib's level number, `0 ..= 9`.  0 means every block is stored.
+    number: Int
+
+// A level from a number, checked.
+//
+// For the caller who has a 0–9 from a config file or a command line.
+// Anything outside the range is `BadLevel`, which carries the number
+// it refused — the one `FlateError` variant with no stream offset,
+// because there is no stream yet.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     match flate.level(11)
+//         Ok(_)  => println("accepted")
+//         Err(_) => println("out of range")            // this one
+// ```
+pub fn level(n: Int) -> Result<FlateLevel, FlateError>
+    todo("flate-nv.level")
+
+// Level 0: every block stored, nothing compressed.
+//
+// Useful, and not a joke: it is how you produce a valid gzip or zlib
+// stream around data that is already compressed, and it is the only
+// level whose output size is knowable in advance (the input plus five
+// bytes per 65,535).
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.stored().number}")              // 0
+// ```
+pub fn stored() -> FlateLevel
+    todo("flate-nv.stored")
+
+// Level 1: the fastest level that still compresses.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.fastest().number}")             // 1
+// ```
+pub fn fastest() -> FlateLevel
+    todo("flate-nv.fastest")
+
+// Level 6: zlib's default, and what almost every gzip file in the
+// world was made with.
+//
+// It is the default here for the same reason it is zlib's: it is
+// where the size curve flattens, and matching it means a stream this
+// package produces is the size a reader expects.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.balanced().number}")            // 6
+// ```
+pub fn balanced() -> FlateLevel
+    todo("flate-nv.balanced")
+
+// Level 9: the smallest output this encoder knows how to make.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.smallest().number}")            // 9
+// ```
+pub fn smallest() -> FlateLevel
+    todo("flate-nv.smallest")
+
+// The level's number, for a caller writing it into a wire field.
+//
+// gzip's XFL byte (RFC 1952 § 2.3.1) records 2 for the slowest level
+// and 4 for the fastest and says nothing about the seven in between,
+// so an encoder has to map this itself; this is the accessor that
+// makes that possible without reaching into the struct.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.level_number(flate.smallest())}")   // 9
+// ```
+pub fn level_number(l: FlateLevel) -> Int
+    todo("flate-nv.level_number")
+
+// A hint about what the data looks like, which changes how the encoder
+// chooses blocks.
+//
+// ENTIRELY ZLIB'S INVENTION.  RFC 1951 has no concept of a strategy;
+// every one of these produces a stream any decoder reads.  It is here
+// because callers porting from zlib expect it and because
+// `FlateHuffmanOnly` and `FlateRle` genuinely matter for PNG filters
+// and for run-heavy data, where the default's match search costs time
+// it cannot recover.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.strategy_name(FlateRle)}")      // rle
+// ```
+pub enum FlateStrategy
+    // The ordinary match search: what zlib does unless told otherwise.
+    FlateDefault
+    // Bias against long matches, for data that has been through a
+    // predictive filter and is mostly small deviations.
+    FlateFiltered
+    // No match search at all — Huffman-code the literals and stop.
+    FlateHuffmanOnly
+    // Match search limited to distance 1, which is run-length encoding
+    // wearing DEFLATE's clothes.
+    FlateRle
+    // Always emit fixed-Huffman blocks (RFC 1951 § 3.2.6), never
+    // dynamic ones.  Smaller encoder state, larger output.
+    FlateFixed
+
+// The name of a strategy, for a message.
+//
+// `default`, `filtered`, `huffman-only`, `rle`, `fixed` — zlib's own
+// spellings, so a caller porting a command line keeps its vocabulary.
+//
+// ```novo
+// use flate
+//
+// fn main() [io]
+//     println("${flate.strategy_name(FlateHuffmanOnly)}")  // huffman-only
+// ```
+pub fn strategy_name(s: FlateStrategy) -> Str
+    todo("flate-nv.strategy_name")

@@ -1,0 +1,265 @@
+// gzip.nv — RFC 1952's header and trailer as values, separately from
+// the stream they wrap.
+//
+// WHY THE HEADER IS ITS OWN VALUE
+//
+// A gzip member is a header, a DEFLATE stream and a trailer, and only
+// the middle one is compression.  Making the header a value the caller
+// can build, read, parse and emit on its own buys three things the
+// interface would otherwise have to invent workarounds for:
+//
+//   · a caller unpacking a `.gz` learns the original file name from
+//     `inflate.gzip_header` before the body arrives, and can create the
+//     output file with the right name;
+//   · a caller writing one sets the name and the modification time,
+//     which is the difference between a `.gz` that round-trips through
+//     `gunzip` and one that unpacks to `noname`;
+//   · a caller SCANNING a multi-member file — every `.gz` produced by
+//     `cat a.gz b.gz` is one — parses headers without decompressing.
+//
+// The alternative shape, options on the encoder, was rejected because
+// it makes the header write-only: there is no way to hand a parsed one
+// back.
+//
+// WHAT IS THE SPECIFICATION AND WHAT IS GZIP'S CHOICE
+//
+// The field layout, the magic `1f 8b`, CM = 8, the flag bits and the
+// little-endian trailer are RFC 1952 and binding.  The DEFAULTS this
+// module hands out are not: `mtime = 0` (RFC 1952 § 2.3.1's "no time
+// available"), OS = 255 (unknown) rather than 3 (Unix), and no header
+// CRC.  gzip(1) writes the real mtime and the real OS; this package
+// will not read a clock, because it is `core` and has no clock to
+// read, and a caller who wants the real one passes it in.  That is the
+// single sharpest place where the sans-IO rule shows through the
+// interface, and the README says so.
+
+// A gzip member's header, RFC 1952 § 2.3.
+//
+// Every field is typed rather than packed into a byte array: the flag
+// byte becomes the three booleans and the three optional fields it
+// gates, so a caller neither builds nor reads a bit mask.  The flag
+// byte is reconstructed by `emit` from what is present.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.header().mtime}")                // 0
+// ```
+pub struct GzipHeader
+    // Modification time as a Unix timestamp, or 0 for "none
+    // available" (RFC 1952 § 2.3.1).  Zero is the default because a
+    // `core` package cannot read a clock — a caller who wants the real
+    // time passes it to `with_mtime`.
+    mtime: Int
+    // The XFL byte: 2 for the slowest compression, 4 for the fastest,
+    // 0 otherwise.  An encoder sets it from its level; a decoder
+    // ignores it, and so should you.
+    xfl: Int
+    // The OS byte: 3 is Unix, 0 is FAT, 255 is unknown, and unknown is
+    // the default here because this package does not know what it is
+    // running on and will not guess.
+    os: Int
+    // The original file name, without a directory, in Latin-1 as RFC
+    // 1952 § 2.3.1 requires; empty for none.  It is what `gunzip`
+    // names the output file.
+    name: Str
+    // A human-readable comment, in Latin-1; empty for none.
+    comment: Str
+    // The FEXTRA field's contents, as its own subfield-structured
+    // bytes; empty for none.  This package does not parse the
+    // subfields — that is a per-application registry (`RA` for random
+    // access, `BC` for bgzip) that belongs where the application is.
+    extra: Bytes
+    // The FTEXT hint: the member is probably text.  Advisory, ignored
+    // by every decompressor, and false by default.
+    is_text: Bool
+    // Whether the header carries a CRC16 of itself (FHCRC).  Rare,
+    // and off by default because most tools do not write it and some
+    // older ones mis-read it.
+    has_header_crc: Bool
+
+// A header with nothing set: no name, no comment, no extra field, no
+// time, unknown OS.
+//
+// The minimum a valid gzip member needs, and what `deflate.deflater`
+// uses under `GzipWrapped` unless told otherwise.  Ten bytes on the
+// wire.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.header().os}")                   // 255
+// ```
+pub fn header() -> GzipHeader
+    todo("flate-nv.gzip.header")
+
+// The header with its original file name set.
+//
+// The name is a BASE name — RFC 1952 § 2.3.1 says directory components
+// are stripped, and a decompressor that honoured a path in it would
+// have a directory-traversal hole.  This package does not enforce that
+// on the way in, because it does not know what a path looks like on
+// the caller's machine, and it does not have one; a caller extracting
+// to disk sanitises what `inflate.gzip_header` gave it, and the README
+// says so in as many words.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_name(gzip.header(), "notes.txt").name}")
+// ```
+pub fn with_name(h: GzipHeader, name: Str) -> GzipHeader
+    todo("flate-nv.gzip.with_name")
+
+// The header with a comment set.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_comment(gzip.header(), "built by novo-lang").comment}")
+// ```
+pub fn with_comment(h: GzipHeader, comment: Str) -> GzipHeader
+    todo("flate-nv.gzip.with_comment")
+
+// The header with a modification time set.
+//
+// A Unix timestamp the caller supplies, because this package has no
+// clock: `core` means no `[time]`, and the alternative — an encoder
+// that reached for the wall clock — is exactly the effect the layer
+// forbids.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_mtime(gzip.header(), 1757376000).mtime}")
+// ```
+pub fn with_mtime(h: GzipHeader, mtime: Int) -> GzipHeader
+    todo("flate-nv.gzip.with_mtime")
+
+// The header with an OS byte set.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_os(gzip.header(), 3).os}")   // 3 — Unix
+// ```
+pub fn with_os(h: GzipHeader, os: Int) -> GzipHeader
+    todo("flate-nv.gzip.with_os")
+
+// The header with an FEXTRA field set.
+//
+// The bytes are written through unexamined.  RFC 1952 § 2.3.1.1 gives
+// them a subfield structure and an application registry, and neither
+// is this package's business.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     let h = gzip.with_extra(gzip.header(), bytes.from_str(""))
+//     println("${bytes.len(h.extra)}")                  // 0
+// ```
+pub fn with_extra(h: GzipHeader, extra: Bytes) -> GzipHeader
+    todo("flate-nv.gzip.with_extra")
+
+// The header with the FTEXT hint set or cleared.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_text(gzip.header(), true).is_text}")     // true
+// ```
+pub fn with_text(h: GzipHeader, is_text: Bool) -> GzipHeader
+    todo("flate-nv.gzip.with_text")
+
+// The header with the FHCRC self-check turned on or off.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${gzip.with_header_crc(gzip.header(), true).has_header_crc}")   // true
+// ```
+pub fn with_header_crc(h: GzipHeader, on: Bool) -> GzipHeader
+    todo("flate-nv.gzip.with_header_crc")
+
+// Parse a header from the front of a buffer: the header, and how many
+// bytes it took.
+//
+// The length matters as much as the header — a gzip header is between
+// ten bytes and megabytes depending on its optional fields, so a
+// caller scanning a multi-member file has no other way to find where
+// the DEFLATE stream starts.
+//
+// `TruncatedStream` when the buffer ends inside the header, which is
+// how a caller feeding a stream knows to come back with more rather
+// than to give up.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     match gzip.parse(bytes.from_str(""))
+//         Ok(_)  => println("parsed")
+//         Err(_) => println("need more bytes")         // this one
+// ```
+pub fn parse(data: Bytes) -> Result<(GzipHeader, Int), FlateError>
+    todo("flate-nv.gzip.parse")
+
+// The header, as the bytes that go on the wire.
+//
+// The flag byte is reconstructed from what is present: FNAME when the
+// name is non-empty, FCOMMENT when the comment is, FEXTRA when the
+// extra field is, plus FTEXT and FHCRC as the two booleans say.  A
+// caller therefore cannot produce a header whose flags and fields
+// disagree, which is the one corruption a hand-built gzip header
+// usually has.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${bytes.len(gzip.emit(gzip.header()))}")     // 10
+// ```
+pub fn emit(h: GzipHeader) -> Bytes
+    todo("flate-nv.gzip.emit")
+
+// A gzip trailer: the CRC32 of the plaintext and its length modulo
+// 2^32, eight little-endian bytes.
+//
+// `isize` is deliberately taken modulo rather than refused: RFC 1952
+// § 2.3.1 defines the field that way, and a member larger than 4 GiB
+// is legal and common.  A caller verifying the field compares modulo
+// too, and `inflate.finish` does.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     println("${bytes.len(gzip.trailer(0, 0))}")           // 8
+// ```
+pub fn trailer(crc: Int, isize: Int) -> Bytes
+    todo("flate-nv.gzip.trailer")
+
+// Parse a trailer at an offset: the CRC32 and the length it claims.
+//
+// Separate from `parse` because they are at opposite ends of the
+// member and a streaming caller reaches them at very different times.
+//
+// ```novo
+// use gzip
+//
+// fn main() [io]
+//     match gzip.parse_trailer(bytes.from_str(""), 0)
+//         Ok(_)  => println("read")
+//         Err(_) => println("truncated")               // this one
+// ```
+pub fn parse_trailer(data: Bytes, offset: Int) -> Result<(Int, Int), FlateError>
+    todo("flate-nv.gzip.parse_trailer")

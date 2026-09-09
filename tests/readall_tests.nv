@@ -1,0 +1,55 @@
+// readall_tests.nv — the API suite for `inflate.read_all`, the one
+// signature in this package that meets a stream.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See flate_tests.nv for
+// why an interface package ships a failing suite.
+//
+// WHY THIS SUITE IS ITS OWN FILE
+//
+// Because it is the effect claim, and the effect claim is the part of
+// an interface release the compiler can already check.  `read_all` is
+// declared
+//
+//     pub fn read_all<S: Read[e]>(src: S, fmt: FlateFormat) -> … [e]
+//
+// and this suite calls it over a `Buffer`, whose `impl Read[]` is
+// empty.  The test functions below therefore need `[io]` for their own
+// `println` and NOTHING for the decode — which is the proof that the
+// bound binds rather than spends.  If `read_all` ever grew a concrete
+// effect of its own, these functions would stop compiling at their
+// declared rows, here, rather than at a consumer's.
+
+use std.test
+use inflate
+
+@test
+fn test_read_all_over_a_buffer_costs_nothing() [io]
+    test.case("an in-memory source charges the caller no effects")
+    // `Buffer`'s `impl Read[]` supplies an empty row, so this call
+    // adds nothing to this function's `[io]` — which is the whole
+    // claim the signature makes.
+    let src = Buffer.from_str("")
+    match inflate.read_all(src, GzipWrapped)
+        Ok(_)  => test.fail("an empty buffer decoded as a gzip stream")
+        Err(_) => test.assert(true)
+
+@test
+fn test_read_all_agrees_with_decompress_on_the_same_bytes() [io]
+    test.case("the pump inside is the same machine as the pump outside")
+    let text = "not a compressed stream at all"
+    let streamed = inflate.read_all(Buffer.from_str(text), ZlibWrapped)
+    let oneshot = inflate.decompress(bytes.from_str(text), ZlibWrapped)
+    match streamed
+        Ok(_)  => match oneshot
+            Ok(_)  => test.assert(true)
+            Err(_) => test.fail("the streaming form accepted what the one-shot form refused")
+        Err(_) => match oneshot
+            Ok(_)  => test.fail("the one-shot form accepted what the streaming form refused")
+            Err(_) => test.assert(true)
+
+@test
+fn test_read_all_refuses_a_raw_stream_that_is_text() [io]
+    test.case("raw DEFLATE has no magic, so this is a decode failure and not a header one")
+    match inflate.read_all(Buffer.from_str("hello, world"), RawDeflate)
+        Ok(_)  => test.fail("plain text decoded as a DEFLATE stream")
+        Err(_) => test.assert(true)

@@ -1,0 +1,66 @@
+// flate_tests.nv — the API suite for the format and level values.
+//
+// RED ON PURPOSE.  Every body in this package is a `todo()`, so every
+// assertion below reaches `not implemented: flate-nv.<fn>` and the
+// suite fails.  That is the expected state of an interface package and
+// it is what makes these tests worth writing NOW: they compile against
+// the signatures, which is the claim being reviewed, and the day a
+// body lands the suite says whether the body agrees with what was
+// promised.
+
+use std.test
+use flate
+
+@test
+fn test_the_four_levels_are_zlibs_numbers() [io]
+    test.case("stored is 0, fastest 1, balanced 6, smallest 9")
+    test.assert(flate.stored().number == 0)
+    test.assert(flate.fastest().number == 1)
+    test.assert(flate.balanced().number == 6)
+    test.assert(flate.smallest().number == 9)
+
+@test
+fn test_level_number_reads_back_what_the_constructor_set() [io]
+    test.case("level_number agrees with the field")
+    test.assert(flate.level_number(flate.stored()) == 0)
+    test.assert(flate.level_number(flate.smallest()) == 9)
+
+@test
+fn test_level_accepts_the_whole_range() [io]
+    test.case("0 and 9 are both in")
+    match flate.level(0)
+        Ok(l)  => test.assert(l.number == 0)
+        Err(_) => test.fail("level 0 refused")
+    match flate.level(9)
+        Ok(l)  => test.assert(l.number == 9)
+        Err(_) => test.fail("level 9 refused")
+
+@test
+fn test_level_refuses_what_is_outside_it() [io]
+    test.case("10 is out")
+    match flate.level(10)
+        Ok(_)            => test.fail("level 10 accepted")
+        Err(BadLevel(n)) => test.assert(n == 10)
+        Err(_)           => test.fail("refused for the wrong reason")
+
+    test.case("-1 is out — it is zlib's C sentinel, not a level")
+    match flate.level(-1)
+        Ok(_)            => test.fail("level -1 accepted")
+        Err(BadLevel(n)) => test.assert(n == -1)
+        Err(_)           => test.fail("refused for the wrong reason")
+
+@test
+fn test_format_names_are_the_wire_spellings() [io]
+    test.case("the names HTTP Content-Encoding uses")
+    test.assert(flate.format_name(RawDeflate) == "raw")
+    test.assert(flate.format_name(ZlibWrapped) == "zlib")
+    test.assert(flate.format_name(GzipWrapped) == "gzip")
+
+@test
+fn test_strategy_names_are_zlibs_spellings() [io]
+    test.case("a caller porting a zlib command line keeps its words")
+    test.assert(flate.strategy_name(FlateDefault) == "default")
+    test.assert(flate.strategy_name(FlateFiltered) == "filtered")
+    test.assert(flate.strategy_name(FlateHuffmanOnly) == "huffman-only")
+    test.assert(flate.strategy_name(FlateRle) == "rle")
+    test.assert(flate.strategy_name(FlateFixed) == "fixed")

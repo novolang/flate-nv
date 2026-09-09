@@ -1,0 +1,110 @@
+// deflate_tests.nv — the API suite for the encoder.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See flate_tests.nv for
+// why an interface package ships a failing suite.
+//
+// The assertions here are about the CONTRACT the three calls make: a
+// fresh encoder has emitted nothing; `push` may legally emit nothing;
+// `flush` always emits; `finish` closes the stream and cannot be
+// undone; and the two header setters are inert once bytes have gone
+// out.  What the compressed bytes actually are is zlib's corpus and
+// the implementation lane's problem.
+
+use std.test
+use flate
+use deflate
+use gzip
+use zlib
+
+@test
+fn test_a_fresh_encoder_has_emitted_nothing() [io]
+    test.case("no header goes out until the first push or flush")
+    let e = deflate.deflater(GzipWrapped, flate.balanced())
+    test.assert(deflate.total_in(e) == 0)
+    test.assert(deflate.total_out(e) == 0)
+    test.assert(deflate.is_done(e) == false)
+
+@test
+fn test_the_encoder_remembers_its_level() [io]
+    test.case("level_of hands back what deflater was given")
+    let e = deflate.deflater(RawDeflate, flate.smallest())
+    test.assert(flate.level_number(deflate.level_of(e)) == 9)
+    let f = deflate.deflater(RawDeflate, flate.stored())
+    test.assert(flate.level_number(deflate.level_of(f)) == 0)
+
+@test
+fn test_the_default_strategy_is_the_default() [io]
+    test.case("nothing exotic unless asked for")
+    let e = deflate.deflater(RawDeflate, flate.balanced())
+    test.assert(flate.strategy_name(deflate.strategy_of(e)) == "default")
+
+    test.case("with_strategy changes it and nothing else")
+    let r = deflate.with_strategy(e, FlateRle)
+    test.assert(flate.strategy_name(deflate.strategy_of(r)) == "rle")
+    test.assert(flate.level_number(deflate.level_of(r)) == 6)
+
+@test
+fn test_push_accepts_input_whether_or_not_it_emits() [io]
+    test.case("total_in counts what was accepted, not what came out")
+    let e = deflate.deflater(RawDeflate, flate.fastest())
+    let (e2, _) = deflate.push(e, bytes.from_str("hello"))
+    test.assert(deflate.total_in(e2) == 5)
+
+@test
+fn test_an_empty_push_changes_nothing() [io]
+    test.case("zero bytes in, zero bytes counted")
+    let e = deflate.deflater(RawDeflate, flate.fastest())
+    let (e2, out) = deflate.push(e, bytes.from_str(""))
+    test.assert(bytes.len(out) == 0)
+    test.assert(deflate.total_in(e2) == 0)
+
+@test
+fn test_flush_emits_what_push_held_back() [io]
+    test.case("the call a protocol boundary needs always produces bytes")
+    let e = deflate.deflater(RawDeflate, flate.fastest())
+    let (e2, _) = deflate.push(e, bytes.from_str("hello hello hello"))
+    let (e3, out) = deflate.flush(e2)
+    test.assert(bytes.len(out) > 0)
+    test.assert(deflate.is_done(e3) == false)
+
+@test
+fn test_finish_closes_the_stream() [io]
+    test.case("the final block and the trailer, and the encoder is done")
+    let e = deflate.deflater(GzipWrapped, flate.balanced())
+    let (e2, out) = deflate.finish(e)
+    test.assert(bytes.len(out) > 0)
+    test.assert(deflate.is_done(e2))
+
+    test.case("pushing into a finished encoder produces nothing")
+    let (_, more) = deflate.push(e2, bytes.from_str("late"))
+    test.assert(bytes.len(more) == 0)
+
+@test
+fn test_total_out_counts_the_container_too() [io]
+    test.case("header and trailer are output")
+    let e = deflate.deflater(GzipWrapped, flate.balanced())
+    let (e2, _) = deflate.finish(e)
+    test.assert(deflate.total_out(e2) >= 18)
+
+@test
+fn test_a_header_setter_is_inert_under_the_wrong_container() [io]
+    test.case("a gzip header on a raw encoder changes nothing and does not fail")
+    let e = deflate.deflater(RawDeflate, flate.fastest())
+    let h = gzip.with_name(gzip.header(), "notes.txt")
+    let e2 = deflate.with_gzip_header(e, h)
+    test.assert(deflate.total_out(e2) == 0)
+
+    test.case("and the same for a zlib header")
+    let e3 = deflate.with_zlib_header(e, zlib.header())
+    test.assert(deflate.total_out(e3) == 0)
+
+@test
+fn test_compress_is_the_three_calls_in_one() [io]
+    test.case("a one-shot gzip stream is at least a header and a trailer")
+    let out = deflate.compress(bytes.from_str("hello"), GzipWrapped, flate.balanced())
+    test.assert(bytes.len(out) >= 18)
+
+    test.case("a raw stream carries no container at all")
+    let raw = deflate.compress(bytes.from_str("hello"), RawDeflate, flate.balanced())
+    test.assert(bytes.len(raw) > 0)
+    test.assert(bytes.len(raw) < bytes.len(out))

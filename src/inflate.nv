@@ -1,0 +1,415 @@
+// inflate.nv — the load-bearing interface: a DEFLATE decoder that
+// performs nothing.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE
+//
+// `flate-nv` is a `core` package, so its budget is no effects at all
+// and it may not read a file, a socket or standard input.  A
+// compressed stream is exactly the thing a caller wants to stream.
+// Those two facts are reconciled by a FEED-AND-DRAIN STATE MACHINE:
+// the host holds the stream, hands this package whatever bytes it has,
+// and gets back the plaintext those bytes produced plus a decoder to
+// hand the next chunk to.  Nothing here reads and nothing here waits.
+//
+//     var d = inflate.inflater(GzipWrapped)
+//     let (d2, out) = inflate.feed(d, chunk)      // as many times as you like
+//     let tail = inflate.finish(d2)!              // once, at end of stream
+//
+// A chunk may split ANYTHING — a Huffman code, a length/distance pair,
+// the two bytes of a zlib header, the gzip trailer between its CRC and
+// its ISIZE — and the decoder carries whatever it could not finish
+// into the next call.  That is the whole contract, and it is why
+// `feed` returns a NEW decoder rather than mutating one: `[mutate]` is
+// a host effect and this package has none.
+//
+// WHY `feed` DOES NOT RETURN A `Result`
+//
+// It returns the output the chunk produced and a decoder that may have
+// gone bad, and `error` is what asks.  A corrupt stream at byte 40,000
+// does not throw away the 39,999 bytes before it: a caller recovering
+// a damaged archive wants the prefix, and a signature that made the
+// failure the return value would have had to choose between the bytes
+// and the reason.  The failure is sticky — once set it is never
+// cleared, because a DEFLATE stream that has lost bit alignment cannot
+// resynchronise and a decoder that tried would be inventing data.
+//
+// `read_all` IS THE SAME MACHINE WITH THE LOOP INSIDE IT
+//
+//     pub fn read_all<S: Read[e]>(src: S, fmt: FlateFormat) -> … [e]
+//
+// The bound binds `Read`'s effect parameter and the clause uses it
+// (SPEC § 5.6), so this one function costs whatever the caller's
+// stream costs — `[io]` for a file, `[io, net]` for a socket, nothing
+// for an in-memory buffer — and the package stays `core`, because the
+// impl that supplies the effect is declared where the host is.
+//
+// WHAT THIS PACKAGE DOES NOT DECIDE
+//
+// It does not choose a size limit for you.  A DEFLATE stream can
+// expand about a thousandfold, so a decoder with no bound is a decoder
+// that will one day be handed a bomb; but the right bound is the
+// caller's memory budget and not this package's opinion, so the
+// default is unbounded and `with_limit` is how a caller states one.
+// The README says so where a reader will see it.
+
+// A decoder between chunks.
+//
+// Opaque in practice — the fields are here so that the state is
+// reviewable rather than because a caller should read them — and
+// carried by value: `feed` returns the next one and the previous one
+// is finished with.  A decoder that has failed stays failed; `error`
+// is what says so, and every subsequent `feed` produces nothing.
+//
+// The 32 KiB window is the largest single thing in it (RFC 1951 § 4
+// caps a back-reference at 32,768), which is what makes an `Inflater`
+// affordable on a device and is why `core` is an honest layer for this
+// package rather than a claim.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.inflater(RawDeflate)
+//     println("${inflate.total_in(d)}")                    // 0
+// ```
+pub struct Inflater
+    // The container this decoder was built for, unchanged.
+    format: FlateFormat
+    // Where the machine is: in the container header, in a block
+    // header, in a stored block, in a fixed or dynamic block's codes,
+    // in the trailer, or done.  An `Int` rather than an enum so the
+    // whole decoder stays cheap to copy.
+    state: Int
+    // Compressed bytes consumed so far, across every `feed`.  The
+    // origin every `FlateError` offset is measured from.
+    consumed: Int
+    // Plaintext bytes produced so far, across every `feed`.
+    produced: Int
+    // The 32 KiB sliding window a back-reference copies out of, as
+    // many bytes as have been produced.
+    window: Bytes
+    // Where the next byte goes in `window`, once it has wrapped.
+    window_at: Int
+    // Bits pulled from the input but not yet consumed by a code, and
+    // how many of them are live — the reason a chunk boundary can fall
+    // anywhere.
+    bit_buf: Int
+    // How many bits in `bit_buf` are live, `0 ..= 32`.
+    bit_count: Int
+    // The running check the container demands: a CRC32 for gzip, an
+    // Adler-32 for zlib, unused for raw.  Packed as its 32-bit value.
+    check: Int
+    // The gzip header, once one has been parsed; absent otherwise.
+    gzip_head: ?GzipHeader
+    // The zlib header, once one has been parsed; absent otherwise.
+    zlib_head: ?ZlibHeader
+    // The output bound from `with_limit`, or `-1` for unbounded.
+    limit: Int
+    // Whether `with_strict` was asked for: refuse trailing bytes.
+    strict: Bool
+    // The sticky failure, or absent.
+    failure: ?FlateError
+
+// A decoder at the start of a stream.
+//
+// The container is fixed for the life of the decoder, because it
+// decides how the first bytes are read: `GzipWrapped` expects `1f 8b`,
+// `ZlibWrapped` expects a CMF/FLG pair, `RawDeflate` expects a block
+// header.  A caller who does not know which it has sniffs the first
+// two bytes and builds the decoder it wants — this package will not
+// guess, because guessing wrong on `RawDeflate` produces plausible
+// garbage rather than an error.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.inflater(ZlibWrapped)
+//     match inflate.error(d)
+//         Some(_) => println("already bad")
+//         None    => println("ready")                      // this one
+// ```
+pub fn inflater(fmt: FlateFormat) -> Inflater
+    todo("flate-nv.inflater")
+
+// Cap how much plaintext this decoder will produce.
+//
+// A DEFLATE stream of a few kilobytes can expand to gigabytes, and a
+// decoder with no bound will eventually be handed one that does.  Past
+// the cap the decoder fails with `OutputTooLarge` carrying the bound,
+// and the bytes produced up to it are still the bytes the earlier
+// `feed` calls returned.
+//
+// A negative bound means unbounded, which is the default, and is the
+// right answer for a caller decompressing something it wrote itself.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.with_limit(inflate.inflater(GzipWrapped), 1048576)
+//     println("${inflate.limit_of(d)}")                    // 1048576
+// ```
+pub fn with_limit(d: Inflater, cap: Int) -> Inflater
+    todo("flate-nv.with_limit")
+
+// The output bound in force, or `-1` for unbounded.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     println("${inflate.limit_of(inflate.inflater(RawDeflate))}")   // -1
+// ```
+pub fn limit_of(d: Inflater) -> Int
+    todo("flate-nv.limit_of")
+
+// Refuse bytes after the end of the stream.
+//
+// Off by default, and that default is the interesting decision: gzip
+// files legitimately concatenate members (RFC 1952 § 2.2), ZIP entries
+// are followed by the next entry, and padded archives are everywhere,
+// so a decoder that refused trailing bytes would refuse most real
+// input.  A caller who is decoding one stream from one buffer and
+// wants to know it consumed all of it turns this on and gets
+// `TrailingGarbage` with the offset of the first extra byte.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.with_strict(inflate.inflater(ZlibWrapped))
+//     println("${inflate.total_in(d)}")                    // 0
+// ```
+pub fn with_strict(d: Inflater) -> Inflater
+    todo("flate-nv.with_strict")
+
+// Feed the next chunk; get back the decoder to feed the chunk after
+// it, and every plaintext byte those bytes produced.
+//
+// An empty chunk is legal and produces nothing — it is NOT an
+// end-of-stream signal, because a caller reading a socket gets empty
+// reads for reasons that are not the end.  `finish` is the
+// end-of-stream signal.
+//
+// A chunk that completes nothing produces an empty result and a
+// decoder carrying the partial state; a chunk that spans four blocks
+// produces all four blocks' output at once.  There is no relationship
+// between input length and output length and a caller must not assume
+// one.
+//
+// A failure does not discard the output already produced from this
+// chunk: it is returned, the decoder is left failed, and `error` says
+// why and where.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.inflater(RawDeflate)
+//     let (_, out) = inflate.feed(d, bytes.from_str(""))
+//     println("${bytes.len(out)}")                         // 0
+// ```
+pub fn feed(d: Inflater, chunk: Bytes) -> (Inflater, Bytes)
+    todo("flate-nv.feed")
+
+// End of stream: whatever the container's trailer released, and the
+// verdict.
+//
+// This is where the checks happen.  Up to here a `feed` has been
+// handing back plaintext it has not yet been able to verify — the
+// checksum lives in the trailer, so a streaming decoder cannot verify
+// as it goes and must not pretend to.  `finish` reads the trailer,
+// compares it against the running check, and returns `Err` on
+// `ChecksumMismatch` or `GzipLengthMismatch`.
+//
+// That is the one thing a caller has to understand about streaming
+// decompression: **bytes a `feed` returned are not yet known to be
+// correct**, and only a successful `finish` says they were.  A caller
+// who cannot tolerate that buffers until `finish` returns, or uses
+// `decompress`, which does.
+//
+// `Err` also for a failure a `feed` recorded earlier, and for the one
+// only the end can find: a stream that stopped mid-block, which is
+// `TruncatedStream`.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     let d = inflate.inflater(RawDeflate)
+//     match inflate.finish(d)
+//         Ok(_)  => println("complete")
+//         Err(_) => println("truncated")                   // this one
+// ```
+pub fn finish(d: Inflater) -> Result<Bytes, FlateError>
+    todo("flate-nv.finish")
+
+// The sticky failure this decoder is carrying, or `None`.
+//
+// Once set it is never cleared.  A DEFLATE stream is a bit stream with
+// no synchronisation marks, so a decoder that lost alignment has no
+// way back and one that tried to find one would be inventing records.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     match inflate.error(inflate.inflater(GzipWrapped))
+//         Some(_) => println("failed")
+//         None    => println("fine")                       // this one
+// ```
+pub fn error(d: Inflater) -> ?FlateError
+    todo("flate-nv.error")
+
+// Whether the decoder has seen the end of the stream.
+//
+// True once the final block and the trailer are behind it, which is
+// how a caller reading a concatenated file knows to start a new
+// decoder rather than to keep feeding this one.  A failed decoder is
+// not done — it is failed, and `error` is the question to ask.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     println("${inflate.is_done(inflate.inflater(RawDeflate))}")    // false
+// ```
+pub fn is_done(d: Inflater) -> Bool
+    todo("flate-nv.is_done")
+
+// Compressed bytes consumed so far, across every `feed`.
+//
+// This is the origin every `FlateError` offset is measured from, and
+// it is what a caller decoding a concatenated gzip file uses to find
+// where the next member starts.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     println("${inflate.total_in(inflate.inflater(GzipWrapped))}")  // 0
+// ```
+pub fn total_in(d: Inflater) -> Int
+    todo("flate-nv.total_in")
+
+// Plaintext bytes produced so far, across every `feed`.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     println("${inflate.total_out(inflate.inflater(GzipWrapped))}") // 0
+// ```
+pub fn total_out(d: Inflater) -> Int
+    todo("flate-nv.total_out")
+
+// The gzip header this decoder parsed, or `None`.
+//
+// `None` before enough bytes have arrived to complete it, and `None`
+// for ever under any container but `GzipWrapped`.  It is here because
+// the header carries the original file name and modification time,
+// which is the whole reason a caller unpacking a `.gz` wanted a
+// streaming decoder rather than a one-shot one — it can create the
+// output file with the right name before the body arrives.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     match inflate.gzip_header(inflate.inflater(GzipWrapped))
+//         Some(_) => println("have it")
+//         None    => println("not yet")                    // this one
+// ```
+pub fn gzip_header(d: Inflater) -> ?GzipHeader
+    todo("flate-nv.gzip_header")
+
+// The zlib header this decoder parsed, or `None`.
+//
+// `None` before the two bytes have arrived, and `None` for ever under
+// any container but `ZlibWrapped`.  Worth reading for its window size,
+// which tells a caller how much memory the encoder assumed.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     match inflate.zlib_header(inflate.inflater(RawDeflate))
+//         Some(_) => println("have it")
+//         None    => println("raw has none")               // this one
+// ```
+pub fn zlib_header(d: Inflater) -> ?ZlibHeader
+    todo("flate-nv.zlib_header")
+
+// Decompress a whole buffer, checks and all.
+//
+// `inflater` + one `feed` + `finish`, for the caller who has the bytes
+// and wants the bytes.  Unlike the streaming form it returns nothing
+// until the trailer has verified, so its `Ok` means the output is
+// known good — which is what most callers want and why this is the
+// function the README leads with.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn main() [io]
+//     match inflate.decompress(bytes.from_str(""), GzipWrapped)
+//         Ok(_)  => println("decoded")
+//         Err(_) => println("not a gzip stream")           // this one
+// ```
+pub fn decompress(data: Bytes, fmt: FlateFormat) -> Result<Bytes, FlateError>
+    todo("flate-nv.decompress")
+
+// Decompress a whole stream, and be charged exactly what the stream
+// costs.
+//
+// THE LOAD-BEARING SIGNATURE OF THIS PACKAGE.  `S: Read[e]` binds the
+// effect parameter of the standard library's `Read` trait and the
+// clause is `[e]`, so the row means "whatever the impl behind `S`
+// supplies" — the call site substitutes it, a `File` charges its
+// caller `[io]`, an in-memory `Buffer` charges nothing, and this
+// package remains `core` because it has not named an effect of its own
+// (SPEC § 5.6, and `docs/publishing.md` § Design).
+//
+// It is the same machine as `feed` and `finish` with the pump written
+// once, here, instead of once per caller.  Use `feed` when the bytes
+// arrive from somewhere this does not fit — a chunked HTTP body, a ZIP
+// entry inside a larger file, a frame at a time from a socket — and
+// use this otherwise.
+//
+// A stream failure comes back as `SourceFailed` carrying the host's
+// own `IoError`, so a caller can still tell a timeout from a truncated
+// file.
+//
+// ```novo
+// use inflate
+// use flate
+//
+// fn read_gz(path: Str) -> Result<Bytes, FlateError> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(SourceFailed(IoNotFound))
+//         Some(f) =>
+//             let h: File = f
+//             inflate.read_all(h, GzipWrapped)
+//
+// fn main() [io, fs]
+//     match read_gz("data.gz")
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_all<S: Read[e]>(src: S, fmt: FlateFormat) -> Result<Bytes, FlateError> [e]
+    todo("flate-nv.read_all")

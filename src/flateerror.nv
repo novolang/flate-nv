@@ -1,0 +1,195 @@
+// flateerror.nv — every way a DEFLATE, zlib or gzip stream can refuse
+// to be decoded, and where in the stream it happened.
+//
+// WHY EVERY VARIANT CARRIES AN OFFSET
+//
+// A compressed stream is not a thing a person edited, so "line 4,812"
+// has no meaning here.  What a person debugging one has instead is a
+// byte offset they can `xxd -s` to, and a decoder that reports a
+// reason without one has told them to bisect the file by hand.  So
+// every variant that is about a place in the stream carries the
+// COMPRESSED-stream offset of the byte the decoder was looking at when
+// it gave up — 0-based, counted from the first byte the first `feed`
+// was given, across every chunk, because a caller feeding 64 KiB at a
+// time does not know where a chunk started in the file either.
+//
+// `offset_of` reads it back and answers `-1` for the three that are
+// not about a place: a level a caller chose before any byte existed,
+// and a transport failure, where the stream never got as far as a
+// byte to blame.
+//
+// WHY THE CHECKSUM AND LENGTH VARIANTS ARE SEPARATE
+//
+// gzip's trailer carries a CRC32 and an ISIZE, zlib's carries an
+// Adler-32, and RFC 1950 § 2.2 / RFC 1952 § 2.3.1 make them separate
+// checks that fail for different reasons: a wrong checksum means the
+// bytes are corrupt, a wrong length means the stream was truncated and
+// then something else was appended.  Flattening the two into one
+// "corrupt" variant loses the difference a person recovering data
+// needs most.
+//
+// `SourceFailed` IS THE LAYER SEAM, and it is not called `Transport`.
+// csv-nv's `CsvError` already declares a `Transport` variant, and
+// variant constructors resolve by NAME rather than by the type the
+// expression is required to have (probed 2026-09-09: `Err(Transport(x))`
+// in a function returning `Result<_, BErr>` binds `AErr`'s constructor
+// and fails E2001).  A second `Transport` in the registry would
+// therefore break the first program that used both packages.  The
+// README's naming section records that; here it is just the reason for
+// the longer name.
+
+// Why a compressed stream, or a request about one, could not be
+// answered.
+//
+// ```novo
+// use flateerror
+//
+// fn main() [io]
+//     let e = BadHuffmanCode(4096)
+//     println("${flateerror.offset_of(e)}")
+// ```
+pub enum FlateError
+    // A stored (uncompressed) block whose LEN and one's-complement
+    // NLEN disagree.  RFC 1951 § 3.2.4 makes the pair the only
+    // integrity check a stored block has, so a mismatch means the bit
+    // stream is out of alignment rather than that one length is
+    // wrong — both are reported because neither is trustworthy.
+    BadStoredLength(offset: Int, len: Int, nlen: Int)
+    // A block header whose two type bits are `11`.  RFC 1951 § 3.2.3
+    // reserves it, and every decoder in existence treats it as the
+    // sign that it is no longer reading DEFLATE at all.
+    BadBlockType(offset: Int)
+    // A code that is not in the Huffman table currently in force.
+    // Either the table is wrong or the bits are; the decoder cannot
+    // tell which, and says only where it stopped being able to read.
+    BadHuffmanCode(offset: Int)
+    // A dynamic block's code-length alphabet did not describe a
+    // complete Huffman tree.  `symbol` is the first symbol with no
+    // code, which is what distinguishes an over-subscribed table from
+    // an under-subscribed one when reading the header by hand.
+    IncompleteHuffmanTable(offset: Int, symbol: Int)
+    // A back-reference that points further back than the window holds.
+    // `distance` is what the stream asked for and `available` how many
+    // bytes have been produced so far — the pair is the whole
+    // diagnosis, because a distance of 300 into a 200-byte output is a
+    // truncated prefix and the same distance into a 40 KiB output is
+    // corruption.
+    BadDistance(offset: Int, distance: Int, available: Int)
+    // The stream ended in the middle of something: a block header, a
+    // length pair, a Huffman code, a trailer.  This is what `finish`
+    // returns for an input that simply stopped, and it is distinct
+    // from a corrupt stream because the fix is different — find the
+    // rest of the file.
+    TruncatedStream(offset: Int)
+    // A zlib header whose CMF/FLG pair is not a zlib header: the
+    // compression method is not 8, the window is larger than 32 KiB,
+    // or `(CMF*256 + FLG)` is not a multiple of 31.  Both bytes are
+    // carried because RFC 1950 § 2.2 packs four fields into them and
+    // the reader wants to see which.
+    BadZlibHeader(offset: Int, cmf: Int, flg: Int)
+    // A zlib header with FDICT set: the stream was compressed against
+    // a preset dictionary this package was not given.  `id` is the
+    // Adler-32 of the dictionary the encoder used, which is the only
+    // handle a caller has for finding it.  Not supported rather than
+    // corrupt — the distinction matters to the caller who CAN supply
+    // the dictionary.
+    ZlibDictionaryRequired(offset: Int, id: Int)
+    // The first two bytes were not `1f 8b`.  `saw` is the 16-bit value
+    // that was there, so a caller can recognise the common
+    // near-misses — a zlib stream, a ZIP local header, HTML from a
+    // proxy that did not compress after all.
+    BadGzipMagic(offset: Int, saw: Int)
+    // A gzip member whose CM byte is not 8.  RFC 1952 § 2.3.1 reserves
+    // 0–7 and defines only 8, so this is a member nothing can read
+    // rather than a corrupt one.
+    BadGzipMethod(offset: Int, method: Int)
+    // A gzip member with FHCRC set whose header CRC16 does not match.
+    // The header is corrupt, which is worth saying before the body is
+    // even attempted, because the field lengths in it are what the
+    // decoder would otherwise trust.
+    BadGzipHeaderCrc(offset: Int, want: Int, got: Int)
+    // The trailer's checksum does not match the data produced —
+    // gzip's CRC32 or zlib's Adler-32, whichever the container
+    // demands.  The output up to this point is still returned by the
+    // `feed` calls that produced it: a caller recovering a damaged
+    // archive wants the prefix.
+    ChecksumMismatch(offset: Int, want: Int, got: Int)
+    // A gzip trailer whose ISIZE does not match the number of bytes
+    // produced, modulo 2^32.  Separate from the checksum because a
+    // matching CRC with a wrong length means a truncated member
+    // followed by something else, and a caller scanning a
+    // multi-member file needs to know which.
+    GzipLengthMismatch(offset: Int, want: Int, got: Int)
+    // Bytes after the end of the stream, under a decoder that was
+    // asked to be strict about it.  Lenient is the default, because
+    // gzip files legitimately concatenate members and padded archives
+    // are everywhere; `inflate.with_strict` is what turns this on.
+    TrailingGarbage(offset: Int)
+    // The output grew past `inflate.with_limit`'s bound.  The bound
+    // exists so that a decoder fed a compression bomb stops at a size
+    // its caller chose rather than at the size of memory.
+    OutputTooLarge(offset: Int, cap: Int)
+    // A compression level outside `0 ..= 9`.  No offset: the fault is
+    // in the call that built the encoder, before any byte existed.
+    BadLevel(level: Int)
+    // The stream underneath `inflate.read_all` failed.  The host's
+    // error, unmodified: this package does not know what a socket
+    // timing out means to the program that opened it.  No offset —
+    // the decoder never reached a byte to blame.
+    SourceFailed(cause: IoError)
+
+// The one-line message, for a caller who is printing rather than
+// matching.
+//
+// It names the reason and, where there is one, the offset, in the
+// shape `at byte 4096: <reason>` — an offset a person can hand to
+// `xxd -s`.  A caller who wants to DECIDE something matches the
+// variant instead.
+//
+// `Result<T, FlateError>` requires this impl — SPEC § 3.4 makes
+// `Error` the bound on a result's error type — so it exists whether or
+// not an interface release has anything to say yet, and its body is a
+// `todo()` like every other body here.
+impl Error for FlateError
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("flate-nv.FlateError.message")
+
+// The 0-based offset into the COMPRESSED stream the error is about, or
+// `-1` when it is not about a place in the stream.
+//
+// The two cases with no offset are `BadLevel` — a level chosen before
+// any byte was read — and `SourceFailed`, where the transport gave up
+// before the decoder saw anything. Offsets are counted from the first
+// byte of the first `feed`, across every chunk, because that is the
+// only origin both the caller and the decoder agree on.
+//
+// ```novo
+// use flateerror
+//
+// fn main() [io]
+//     println("${flateerror.offset_of(BadLevel(11))}")        // -1
+// ```
+pub fn offset_of(e: FlateError) -> Int
+    todo("flate-nv.offset_of")
+
+// Whether this error means the bytes are damaged, as opposed to
+// missing or unsupported.
+//
+// Three answers collapse into one boolean here on purpose: a caller
+// deciding whether to RETRY wants to know only whether more bytes
+// could help. `TruncatedStream` and `SourceFailed` say yes — the rest
+// of the file might arrive. Everything else says no: a corrupt block,
+// a reserved method, a dictionary that was never supplied. That is
+// the whole question, and a caller who wants the finer distinction
+// matches the variant.
+//
+// ```novo
+// use flateerror
+//
+// fn main() [io]
+//     if flateerror.is_corrupt(BadBlockType(64))
+//         println("damaged")                                  // this one
+// ```
+pub fn is_corrupt(e: FlateError) -> Bool
+    todo("flate-nv.is_corrupt")

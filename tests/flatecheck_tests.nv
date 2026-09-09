@@ -1,0 +1,70 @@
+// flatecheck_tests.nv — the API suite for the two checksums.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See flate_tests.nv for
+// why an interface package ships a failing suite.
+//
+// The vectors here are the ones every checksum implementation is
+// checked against — the empty input, "a", and the nine-byte
+// "123456789" that appears in RFC 1950 § 9 and in the CRC catalogue —
+// so the day a body lands this suite is a real oracle rather than a
+// shape check.
+
+use std.test
+use flatecheck
+
+@test
+fn test_the_empty_checksums_are_not_both_zero() [io]
+    test.case("CRC32 of nothing is 0")
+    test.assert(flatecheck.crc32_of(bytes.from_str("")) == 0)
+
+    test.case("Adler-32 of nothing is 1, because lo seeds at one")
+    test.assert(flatecheck.adler32_of(bytes.from_str("")) == 1)
+
+@test
+fn test_crc32_of_the_catalogue_vector() [io]
+    test.case("CRC32(\"123456789\") is 0xCBF43926")
+    test.assert(flatecheck.crc32_of(bytes.from_str("123456789")) == 0xCBF43926)
+
+@test
+fn test_adler32_of_the_rfc_vector() [io]
+    test.case("Adler-32(\"123456789\") is 0x091E01DE")
+    test.assert(flatecheck.adler32_of(bytes.from_str("123456789")) == 0x091E01DE)
+
+@test
+fn test_splitting_the_input_does_not_change_the_crc() [io]
+    test.case("the rolling form agrees with the one-shot form")
+    let whole = flatecheck.crc32_of(bytes.from_str("123456789"))
+    let a = flatecheck.crc32_update(flatecheck.crc32(), bytes.from_str("1234"))
+    let b = flatecheck.crc32_update(a, bytes.from_str("56789"))
+    test.assert(flatecheck.crc32_value(b) == whole)
+
+@test
+fn test_splitting_the_input_does_not_change_the_adler() [io]
+    test.case("the rolling form agrees with the one-shot form")
+    let whole = flatecheck.adler32_of(bytes.from_str("123456789"))
+    let a = flatecheck.adler32_update(flatecheck.adler32(), bytes.from_str("12"))
+    let b = flatecheck.adler32_update(a, bytes.from_str("3456789"))
+    test.assert(flatecheck.adler32_value(b) == whole)
+
+@test
+fn test_an_empty_chunk_folds_in_as_nothing() [io]
+    test.case("feeding zero bytes leaves the value alone")
+    let a = flatecheck.crc32_update(flatecheck.crc32(), bytes.from_str("hello"))
+    let b = flatecheck.crc32_update(a, bytes.from_str(""))
+    test.assert(flatecheck.crc32_value(b) == flatecheck.crc32_value(a))
+
+@test
+fn test_reading_the_value_twice_gives_the_same_answer() [io]
+    test.case("the final complement is applied in the accessor, not the update")
+    let a = flatecheck.crc32_update(flatecheck.crc32(), bytes.from_str("abc"))
+    test.assert(flatecheck.crc32_value(a) == flatecheck.crc32_value(a))
+
+@test
+fn test_the_checksums_are_32_bit_unsigned() [io]
+    test.case("a value fits in 0 ..= 4294967295")
+    let c = flatecheck.crc32_of(bytes.from_str("the quick brown fox"))
+    test.assert(c >= 0)
+    test.assert(c <= 4294967295)
+    let a = flatecheck.adler32_of(bytes.from_str("the quick brown fox"))
+    test.assert(a >= 0)
+    test.assert(a <= 4294967295)
