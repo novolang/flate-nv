@@ -1,6 +1,6 @@
 [package]
 name        = "flate-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "DEFLATE with the gzip and zlib wrappers, decoded and encoded without performing anything: a feed-and-drain decoder the host pumps, an encoder that returns bytes, the two container headers as typed values, CRC32 and Adler-32 as the checks each container demands, compression levels as a value rather than a magic integer, and errors that name the byte offset in the compressed stream."
 license     = "Apache-2.0"
 
@@ -25,6 +25,7 @@ category    = "compression"
 tags        = ["deflate", "gzip", "zlib", "compression", "rfc1951", "rfc1952", "crc32", "sans-io"]
 repository  = "https://github.com/novolang/flate-nv"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
