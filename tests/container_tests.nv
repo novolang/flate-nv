@@ -1,0 +1,173 @@
+// container_tests.nv — the API suite for the gzip and zlib headers.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See flate_tests.nv for
+// why an interface package ships a failing suite.
+//
+// The two containers are tested together because the assertions worth
+// writing are mostly about the DIFFERENCE between them: ten bytes
+// against two, little-endian against big-endian, a CRC32 against an
+// Adler-32.  Those are the four places a caller who has ported one
+// gets the other wrong.
+
+use std.test
+use gzip
+use zlib
+
+@test
+fn test_a_default_gzip_header_is_the_minimum_member() [io]
+    test.case("no name, no comment, no extra, no time, unknown OS")
+    let h = gzip.header()
+    test.assert(h.mtime == 0)
+    test.assert(h.os == 255)
+    test.assert(h.name == "")
+    test.assert(h.comment == "")
+    test.assert(h.is_text == false)
+    test.assert(h.has_header_crc == false)
+
+    test.case("and it is ten bytes on the wire")
+    test.assert(bytes.len(gzip.emit(h)) == 10)
+
+@test
+fn test_every_gzip_builder_changes_one_field() [io]
+    let base = gzip.header()
+
+    test.case("with_name")
+    test.assert(gzip.with_name(base, "notes.txt").name == "notes.txt")
+
+    test.case("with_comment")
+    test.assert(gzip.with_comment(base, "hello").comment == "hello")
+
+    test.case("with_mtime")
+    test.assert(gzip.with_mtime(base, 1757376000).mtime == 1757376000)
+
+    test.case("with_os")
+    test.assert(gzip.with_os(base, 3).os == 3)
+
+    test.case("with_text")
+    test.assert(gzip.with_text(base, true).is_text)
+
+    test.case("with_header_crc")
+    test.assert(gzip.with_header_crc(base, true).has_header_crc)
+
+    test.case("with_extra")
+    test.assert(bytes.len(gzip.with_extra(base, bytes.from_str("ab")).extra) == 2)
+
+@test
+fn test_a_gzip_builder_leaves_the_other_fields_alone() [io]
+    test.case("with_name does not move the OS byte")
+    let base = gzip.header()
+    let h = gzip.with_name(base, "notes.txt")
+    test.assert(h.os == base.os)
+    test.assert(h.mtime == base.mtime)
+    test.assert(h.comment == base.comment)
+
+@test
+fn test_a_named_gzip_header_is_longer_on_the_wire() [io]
+    test.case("FNAME adds the name and its terminator")
+    let named = gzip.with_name(gzip.header(), "notes.txt")
+    test.assert(bytes.len(gzip.emit(named)) == 20)
+
+@test
+fn test_gzip_parse_needs_the_whole_header() [io]
+    test.case("an empty buffer is a truncation, not a bad magic")
+    match gzip.parse(bytes.from_str(""))
+        Ok(_)                     => test.fail("nothing parsed as a gzip header")
+        Err(TruncatedStream(off)) => test.assert(off == 0)
+        Err(_)                    => test.fail("refused for the wrong reason")
+
+@test
+fn test_gzip_parse_names_a_wrong_magic() [io]
+    test.case("a zlib stream mistaken for gzip says what it saw")
+    match gzip.parse(bytes.from_str("\x78\x9c\x00\x00\x00\x00\x00\x00\x00\x00"))
+        Ok(_)                   => test.fail("a zlib header parsed as gzip")
+        Err(BadGzipMagic(_, _)) => test.assert(true)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_the_gzip_trailer_is_eight_bytes() [io]
+    test.case("a CRC32 and a length, little-endian")
+    test.assert(bytes.len(gzip.trailer(0, 0)) == 8)
+    test.assert(bytes.len(gzip.trailer(4294967295, 4294967295)) == 8)
+
+@test
+fn test_a_gzip_trailer_round_trips() [io]
+    test.case("what trailer wrote, parse_trailer reads")
+    let t = gzip.trailer(3735928559, 512)
+    match gzip.parse_trailer(t, 0)
+        Ok((crc, size)) =>
+            test.assert(crc == 3735928559)
+            test.assert(size == 512)
+        Err(_)          => test.fail("a trailer this package wrote would not parse")
+
+@test
+fn test_a_default_zlib_header_is_two_bytes() [io]
+    test.case("32 KiB window, no dictionary")
+    let h = zlib.header()
+    test.assert(h.window_bits == 15)
+    match h.dict_id
+        None    => test.assert(true)
+        Some(_) => test.fail("a default header demands a dictionary")
+    test.assert(bytes.len(zlib.emit(h)) == 2)
+
+@test
+fn test_every_zlib_builder_changes_one_field() [io]
+    let base = zlib.header()
+
+    test.case("with_window_bits")
+    test.assert(zlib.with_window_bits(base, 10).window_bits == 10)
+
+    test.case("with_level_hint")
+    test.assert(zlib.with_level_hint(base, 3).level_hint == 3)
+
+    test.case("with_dict_id sets FDICT")
+    match zlib.with_dict_id(base, 305419896).dict_id
+        Some(id) => test.assert(id == 305419896)
+        None     => test.fail("with_dict_id set nothing")
+
+@test
+fn test_a_dictionary_header_is_six_bytes() [io]
+    test.case("FDICT appends the four-byte dictionary id")
+    let h = zlib.with_dict_id(zlib.header(), 305419896)
+    match zlib.emit_checked(h)
+        Ok(b)  => test.assert(bytes.len(b) == 6)
+        Err(_) => test.fail("a dictionary header would not emit")
+
+@test
+fn test_emit_checked_refuses_an_impossible_window() [io]
+    test.case("with_window_bits defers its validation to here")
+    match zlib.emit_checked(zlib.with_window_bits(zlib.header(), 99))
+        Ok(_)                       => test.fail("a 99-bit window emitted")
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        Err(_)                      => test.fail("refused for the wrong reason")
+
+@test
+fn test_zlib_parse_needs_both_bytes() [io]
+    test.case("one byte is a truncation")
+    match zlib.parse(bytes.from_str("\x78"))
+        Ok(_)                   => test.fail("one byte parsed as a zlib header")
+        Err(TruncatedStream(_)) => test.assert(true)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_zlib_parse_enforces_the_check_digit() [io]
+    test.case("a pair that is not a multiple of 31 is not a zlib header")
+    match zlib.parse(bytes.from_str("\x78\x00"))
+        Ok(_)                       => test.fail("a bad check digit was accepted")
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        Err(_)                      => test.fail("refused for the wrong reason")
+
+@test
+fn test_the_zlib_trailer_is_four_big_endian_bytes() [io]
+    test.case("four bytes, and the other endianness from gzip's")
+    test.assert(bytes.len(zlib.trailer(1)) == 4)
+    match zlib.parse_trailer(zlib.trailer(305419896), 0)
+        Ok(a)  => test.assert(a == 305419896)
+        Err(_) => test.fail("a trailer this package wrote would not parse")
+
+@test
+fn test_a_zlib_trailer_needs_four_bytes_to_parse() [io]
+    test.case("three is a truncation")
+    match zlib.parse_trailer(bytes.from_str("\x00\x00\x00"), 0)
+        Ok(_)                   => test.fail("three bytes parsed as an Adler-32")
+        Err(TruncatedStream(_)) => test.assert(true)
+        Err(_)                  => test.fail("refused for the wrong reason")

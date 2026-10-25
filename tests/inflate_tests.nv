@@ -1,0 +1,114 @@
+// inflate_tests.nv — the API suite for the decoder, which is this
+// package's load-bearing interface.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See flate_tests.nv for
+// why an interface package ships a failing suite.
+//
+// What these assert is the CONTRACT rather than the compression: that
+// a fresh decoder is not already failed and not already done, that
+// `feed` is chunk-boundary-agnostic, that an empty chunk is not an end
+// of stream, that a failure is sticky, and that `finish` is where the
+// trailer is checked.  The bit-level vectors belong to the
+// implementation lane and to zlib's corpus; these are the promises the
+// signatures make.
+
+use std.test
+use inflate
+use flateerror
+use flate
+
+@test
+fn test_a_fresh_decoder_is_clean() [io]
+    test.case("nothing consumed, nothing produced, no failure, not done")
+    let d = inflate.inflater(GzipWrapped)
+    test.assert(inflate.total_in(d) == 0)
+    test.assert(inflate.total_out(d) == 0)
+    test.assert(inflate.is_done(d) == false)
+    match inflate.error(d)
+        None    => test.assert(true)
+        Some(_) => test.fail("a fresh decoder is already failed")
+
+@test
+fn test_the_default_is_unbounded() [io]
+    test.case("no size limit until a caller states one")
+    test.assert(inflate.limit_of(inflate.inflater(RawDeflate)) == -1)
+
+    test.case("with_limit states one")
+    let d = inflate.with_limit(inflate.inflater(RawDeflate), 1048576)
+    test.assert(inflate.limit_of(d) == 1048576)
+
+    test.case("a negative bound means unbounded again")
+    test.assert(inflate.limit_of(inflate.with_limit(d, -1)) == -1)
+
+@test
+fn test_an_empty_chunk_is_not_an_end_of_stream() [io]
+    test.case("feeding nothing produces nothing and does not finish the decoder")
+    let d = inflate.inflater(RawDeflate)
+    let (d2, out) = inflate.feed(d, bytes.from_str(""))
+    test.assert(bytes.len(out) == 0)
+    test.assert(inflate.is_done(d2) == false)
+    match inflate.error(d2)
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty chunk failed the decoder")
+
+@test
+fn test_finishing_an_empty_stream_is_truncation() [io]
+    test.case("a decoder that saw no bytes has a truncated stream, not an empty one")
+    match inflate.finish(inflate.inflater(RawDeflate))
+        Ok(_)                     => test.fail("an empty input decoded as a complete stream")
+        Err(TruncatedStream(off)) => test.assert(off == 0)
+        Err(_)                    => test.fail("refused for the wrong reason")
+
+@test
+fn test_a_gzip_stream_that_is_not_one_names_what_it_saw() [io]
+    test.case("BadGzipMagic carries the two bytes that were there")
+    match inflate.decompress(bytes.from_str("PK"), GzipWrapped)
+        Ok(_)                   => test.fail("a ZIP local header decoded as gzip")
+        Err(BadGzipMagic(_, _)) => test.assert(true)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_no_header_is_available_before_one_has_been_parsed() [io]
+    test.case("gzip_header is None on a fresh gzip decoder")
+    match inflate.gzip_header(inflate.inflater(GzipWrapped))
+        None    => test.assert(true)
+        Some(_) => test.fail("a header appeared before any bytes did")
+
+    test.case("zlib_header is None for ever on a raw decoder")
+    match inflate.zlib_header(inflate.inflater(RawDeflate))
+        None    => test.assert(true)
+        Some(_) => test.fail("a raw stream produced a zlib header")
+
+@test
+fn test_strictness_is_off_by_default() [io]
+    test.case("a decoder tolerates trailing bytes unless asked not to")
+    let d = inflate.inflater(GzipWrapped)
+    let s = inflate.with_strict(d)
+    test.assert(inflate.total_in(s) == inflate.total_in(d))
+
+@test
+fn test_every_error_offset_is_a_place_or_minus_one() [io]
+    test.case("a stream error has an offset")
+    test.assert(flateerror.offset_of(BadBlockType(64)) == 64)
+    test.assert(flateerror.offset_of(BadDistance(120, 300, 200)) == 120)
+
+    test.case("a level and a transport failure have none")
+    test.assert(flateerror.offset_of(BadLevel(11)) == -1)
+    test.assert(flateerror.offset_of(SourceFailed(IoNotFound)) == -1)
+
+@test
+fn test_corruption_and_truncation_are_told_apart() [io]
+    test.case("more bytes could help: truncation and transport")
+    test.assert(flateerror.is_corrupt(TruncatedStream(40)) == false)
+    test.assert(flateerror.is_corrupt(SourceFailed(IoNotFound)) == false)
+
+    test.case("more bytes cannot help: a corrupt block or a bad checksum")
+    test.assert(flateerror.is_corrupt(BadBlockType(64)))
+    test.assert(flateerror.is_corrupt(ChecksumMismatch(900, 1, 2)))
+
+@test
+fn test_decompress_verifies_before_it_returns() [io]
+    test.case("the one-shot form has no unverified-output caveat")
+    match inflate.decompress(bytes.from_str(""), ZlibWrapped)
+        Ok(_)  => test.fail("an empty input decoded as a zlib stream")
+        Err(_) => test.assert(true)

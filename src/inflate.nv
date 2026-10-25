@@ -73,6 +73,11 @@
 //     let d = inflate.inflater(RawDeflate)
 //     println("${inflate.total_in(d)}")                    // 0
 // ```
+use flate
+use flateerror
+use gzip
+use zlib
+
 pub struct Inflater
     // The container this decoder was built for, unchanged.
     format: FlateFormat

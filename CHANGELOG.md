@@ -5,6 +5,10 @@ All notable changes to flate-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant has the `use` line for that module (E2033, E2003).  No signature changed.
+
 ## 0.0.3 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.
