@@ -7,7 +7,7 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## 0.0.4 — 2026-10-25
 
-A file that names a sibling module's type, function or constant has the `use` line for that module (E2033, E2003).  No signature changed.
+A file that names a sibling module's type, function or constant has the `use` line for that module (E2033, E2003), and the two signature illustrations in the README are fenced as illustrations.  No signature changed.
 
 ## 0.0.3 — 2026-09-12
 

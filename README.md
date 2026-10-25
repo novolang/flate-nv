@@ -95,7 +95,7 @@ file, reads a clock or waits for anything.
 The one function that meets a stream is `inflate.read_all`, and it charges its
 caller rather than declaring an effect of its own:
 
-```novo
+```novo ignore
 pub fn read_all<S: Read[e]>(src: S, fmt: FlateFormat) -> Result<Bytes, FlateError> [e]
 ```
 
@@ -109,7 +109,7 @@ memory.** Two calls, and `decompress` verifies the trailer before it returns.
 **Use `inflate.inflater`, `feed` and `finish` when the input arrives in
 pieces.**
 
-```novo
+```novo ignore
 pub fn inflater(fmt: FlateFormat) -> Inflater
 pub fn feed(d: Inflater, chunk: Bytes) -> (Inflater, Bytes)
 pub fn finish(d: Inflater) -> Result<Bytes, FlateError>
