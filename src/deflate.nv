@@ -1,0 +1,334 @@
+// deflate.nv — the encoder: bytes in, compressed bytes out, nothing
+// performed.
+//
+// THE SHAPE, AND WHY IT IS NOT THE DECODER'S
+//
+// The decoder is `feed` / `finish` because a decoder cannot know
+// whether it is done until the stream says so.  An encoder knows: the
+// caller says.  So the encoder is `push` / `flush` / `finish`, and the
+// three are genuinely different questions:
+//
+//     var e = deflate.deflater(GzipWrapped, flate.balanced())
+//     let (e2, out) = deflate.push(e, chunk)     // give me more input
+//     let (e3, out) = deflate.flush(e2)          // emit what you are holding
+//     let (e4, tail) = deflate.finish(e3)        // the final block and trailer
+//
+// `push` may return NOTHING for a large chunk — an encoder holds a
+// window's worth of input looking for matches, and emitting early
+// would mean emitting worse.  `flush` is how a caller who needs bytes
+// on the wire NOW gets them, at a cost in ratio, and it is the whole
+// reason the two are separate calls: an HTTP server streaming a
+// response has to flush at the end of each message and a file
+// compressor must not.
+//
+// `finish` is not optional.  A DEFLATE stream ends with a block whose
+// BFINAL bit is set (RFC 1951 § 3.2.3) and both containers end with a
+// trailer; a caller who stops at the last `push` has written a stream
+// nothing can read.
+//
+// WHY `push` DOES NOT RETURN A `Result`
+//
+// Compression cannot fail on well-formed input.  The one thing that
+// can go wrong — a level outside 0–9 — is caught by `flate.level`
+// before an encoder exists, so every function here returns bytes
+// rather than a result, and the signatures say so.  That is a
+// deliberate asymmetry with `inflate`: a decoder's input comes from
+// somewhere else and can be anything, an encoder's comes from the
+// caller and is already bytes.
+//
+// WHAT IS THE SPECIFICATION AND WHAT IS ZLIB'S CHOICE
+//
+// That the output is a valid DEFLATE stream is RFC 1951 and binding.
+// WHICH valid stream — where blocks are split, when a dynamic table
+// beats a fixed one, how far the match search looks — is entirely this
+// encoder's business, and zlib's answers are not the specification
+// even though zlib's output is what every test corpus contains.  The
+// README says what this means for testing: byte-for-byte equality with
+// zlib is an aspiration for the default level and NOT a correctness
+// condition, and the correctness condition is that zlib can inflate
+// what this deflates and vice versa.
+
+use flate
+use gzip
+use zlib
+
+// An encoder between chunks.
+//
+// Opaque in practice, and carried by value like everything else here:
+// `push` returns the next one.  The dominant cost in it is the match
+// window and the hash chains over it, which is why an encoder is
+// meaningfully more expensive than a decoder and why an embedded
+// caller usually wants `flate.stored()` or `FlateHuffmanOnly`.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(RawDeflate, flate.fastest())
+//     println("${deflate.total_in(e)}")                    // 0
+// ```
+pub struct Deflater
+    // The container this encoder emits, unchanged.
+    format: FlateFormat
+    // The level this encoder was built with, unchanged.
+    level: FlateLevel
+    // The block-choice hint in force; `FlateDefault` unless
+    // `with_strategy` said otherwise.
+    strategy: FlateStrategy
+    // Where the machine is: before the header, mid-block, or done.
+    state: Int
+    // Uncompressed bytes accepted so far, across every `push`.
+    consumed: Int
+    // Compressed bytes emitted so far, across every call.
+    produced: Int
+    // Input held back for the match search: at most a window plus a
+    // block's worth, never more, which is what bounds an encoder's
+    // memory to something a device can afford.
+    pending: Bytes
+    // Bits emitted into the current output byte but not yet flushed,
+    // and how many — DEFLATE is a bit stream, so a block boundary
+    // almost never lands on a byte boundary.
+    bit_buf: Int
+    // How many bits in `bit_buf` are live, `0 ..= 7`.
+    bit_count: Int
+    // The running check the container demands: a CRC32 for gzip, an
+    // Adler-32 for zlib, unused for raw.  Packed as its 32-bit value.
+    check: Int
+    // The gzip header to emit, once, before the first block; absent
+    // under any other container.
+    gzip_head: ?GzipHeader
+    // The zlib header to emit, once, before the first block; absent
+    // under any other container.
+    zlib_head: ?ZlibHeader
+
+// An encoder at the start of a stream.
+//
+// The container and the level are fixed for the life of the encoder.
+// Under `GzipWrapped` a default header is emitted — no name, no
+// comment, `mtime` zero — and `with_gzip_header` is how a caller who
+// has a file name replaces it; under `ZlibWrapped` the window bits and
+// the level hint are derived from the level.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(GzipWrapped, flate.balanced())
+//     println("${flate.level_number(deflate.level_of(e))}")    // 6
+// ```
+pub fn deflater(fmt: FlateFormat, l: FlateLevel) -> Deflater
+    todo("flate-nv.deflater")
+
+// The level this encoder was built with.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(RawDeflate, flate.smallest())
+//     println("${flate.level_number(deflate.level_of(e))}")    // 9
+// ```
+pub fn level_of(e: Deflater) -> FlateLevel
+    todo("flate-nv.level_of")
+
+// Choose how blocks are formed.
+//
+// Zlib's invention, not RFC 1951's: every strategy produces a stream
+// any decoder reads, and the choice is about time and ratio on data
+// whose shape the caller knows.  `FlateHuffmanOnly` on already-filtered
+// PNG scanlines and `FlateRle` on run-heavy data are the two that pay
+// for themselves; the rest is a knob for a caller porting a zlib call
+// site verbatim.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.with_strategy(deflate.deflater(RawDeflate, flate.fastest()), FlateRle)
+//     println("${flate.strategy_name(deflate.strategy_of(e))}")    // rle
+// ```
+pub fn with_strategy(e: Deflater, s: FlateStrategy) -> Deflater
+    todo("flate-nv.with_strategy")
+
+// The strategy in force.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(RawDeflate, flate.fastest())
+//     println("${flate.strategy_name(deflate.strategy_of(e))}")    // default
+// ```
+pub fn strategy_of(e: Deflater) -> FlateStrategy
+    todo("flate-nv.strategy_of")
+
+// Replace the gzip header this encoder will emit.
+//
+// Only meaningful before the first `push` or `flush` — once a header
+// has gone out it cannot be recalled, and calling this afterwards
+// changes nothing.  Under any container but `GzipWrapped` it changes
+// nothing either, and does not fail: an encoder is not the place to
+// discover that a caller built the wrong container, and the header
+// value is harmless where it is not used.
+//
+// ```novo
+// use deflate
+// use flate
+// use gzip
+//
+// fn main() [io]
+//     let h = gzip.with_name(gzip.header(), "notes.txt")
+//     let e = deflate.with_gzip_header(deflate.deflater(GzipWrapped, flate.balanced()), h)
+//     println("${deflate.total_out(e)}")                   // 0
+// ```
+pub fn with_gzip_header(e: Deflater, h: GzipHeader) -> Deflater
+    todo("flate-nv.with_gzip_header")
+
+// Replace the zlib header this encoder will emit.
+//
+// The one reason to reach for this is a preset dictionary: setting a
+// dict id makes the encoder emit FDICT, which every decoder will then
+// demand the dictionary for.  Otherwise the header `deflater` derives
+// from the level is the one you want.
+//
+// ```novo
+// use deflate
+// use flate
+// use zlib
+//
+// fn main() [io]
+//     let e = deflate.with_zlib_header(deflate.deflater(ZlibWrapped, flate.balanced()), zlib.header())
+//     println("${deflate.total_out(e)}")                   // 0
+// ```
+pub fn with_zlib_header(e: Deflater, h: ZlibHeader) -> Deflater
+    todo("flate-nv.with_zlib_header")
+
+// Give the encoder more input; get back the encoder to give the next
+// chunk to, and whatever bytes were ready.
+//
+// **The output may be empty, and usually is for small chunks.** An
+// encoder holds input back to find matches in it; bytes come out when
+// a block is worth emitting, not when a chunk arrives.  A caller who
+// treats an empty result as an error, or as end of stream, has
+// misread the contract — the only calls that guarantee output are
+// `flush` and `finish`.
+//
+// An empty chunk is legal and produces nothing.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(RawDeflate, flate.fastest())
+//     let (_, out) = deflate.push(e, bytes.from_str("hello"))
+//     println("${bytes.len(out)}")                         // very likely 0
+// ```
+pub fn push(e: Deflater, chunk: Bytes) -> (Deflater, Bytes)
+    todo("flate-nv.push")
+
+// Emit everything the encoder is holding, ending the current block.
+//
+// This is zlib's `Z_SYNC_FLUSH`: the held input is written out as a
+// block and the bit stream is padded to a byte boundary with an empty
+// stored block, so a decoder on the other end can produce every byte
+// pushed so far.  The stream stays open — this is not `finish`.
+//
+// It costs ratio, and the cost is not small on small flushes, because
+// a block that ends early is a block whose Huffman table was chosen
+// from less data.  Flush when a protocol requires it — the end of an
+// HTTP chunk, a message boundary on a socket — and not otherwise.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(RawDeflate, flate.fastest())
+//     let (e2, _) = deflate.push(e, bytes.from_str("hello"))
+//     let (_, out) = deflate.flush(e2)
+//     println("${bytes.len(out) > 0}")                     // true
+// ```
+pub fn flush(e: Deflater) -> (Deflater, Bytes)
+    todo("flate-nv.flush")
+
+// End the stream: the last block with BFINAL set, and the container's
+// trailer.
+//
+// Not optional.  Without it the output is a DEFLATE stream with no
+// final block and no checksum, which every decoder in the world
+// reports as truncated.  The encoder it returns is done; pushing into
+// it produces nothing.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let e = deflate.deflater(GzipWrapped, flate.balanced())
+//     let (e2, _) = deflate.finish(e)
+//     println("${deflate.is_done(e2)}")                    // true
+// ```
+pub fn finish(e: Deflater) -> (Deflater, Bytes)
+    todo("flate-nv.finish")
+
+// Whether `finish` has been called.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     println("${deflate.is_done(deflate.deflater(RawDeflate, flate.fastest()))}")   // false
+// ```
+pub fn is_done(e: Deflater) -> Bool
+    todo("flate-nv.is_done")
+
+// Uncompressed bytes accepted so far, across every `push`.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     println("${deflate.total_in(deflate.deflater(RawDeflate, flate.fastest()))}")  // 0
+// ```
+pub fn total_in(e: Deflater) -> Int
+    todo("flate-nv.total_in")
+
+// Compressed bytes emitted so far, header and trailer included.
+//
+// The pair with `total_in` is the compression ratio, which is the
+// number a caller reports and the number a test asserts a bound on.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     println("${deflate.total_out(deflate.deflater(RawDeflate, flate.fastest()))}") // 0
+// ```
+pub fn total_out(e: Deflater) -> Int
+    todo("flate-nv.total_out")
+
+// Compress a whole buffer, header and trailer and all.
+//
+// `deflater` + one `push` + `finish`, for the caller who has the bytes
+// and wants the bytes.  No `Result`: with a `FlateLevel` in hand there
+// is nothing left that can fail.
+//
+// ```novo
+// use deflate
+// use flate
+//
+// fn main() [io]
+//     let out = deflate.compress(bytes.from_str("hello"), GzipWrapped, flate.balanced())
+//     println("${bytes.len(out) > 0}")                     // true
+// ```
+pub fn compress(data: Bytes, fmt: FlateFormat, l: FlateLevel) -> Bytes
+    todo("flate-nv.compress")

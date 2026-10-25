@@ -1,0 +1,185 @@
+// flatecheck.nv — the two integrity checks the two containers demand.
+//
+// WHY THIS PACKAGE OWNS THEM AT ALL
+//
+// A CRC32 is not a compression algorithm and would be happier in a
+// checksum package.  It is here because the CONTAINERS are here: RFC
+// 1952 § 2.3.1 makes a gzip trailer a CRC32 and RFC 1950 § 2.2 makes a
+// zlib trailer an Adler-32, and a decoder that could not verify its own
+// trailer would be shipping the caller a stream it had not checked.
+// Exposing them rather than hiding them costs nothing and buys two
+// things: zip-nv needs exactly this CRC32 for its directory entries and
+// gets it from its existing dependency, and a caller streaming a large
+// file can compute the check incrementally alongside a decode it is
+// doing for its own reasons.
+//
+// BOTH ARE ROLLING VALUES, NOT ONE-SHOT FUNCTIONS
+//
+// `[mutate]` is a host effect and this is a `core` package, so an
+// updater cannot modify a checksum in place.  Each update returns the
+// next value:
+//
+//     var c = flatecheck.crc32()
+//     c = flatecheck.crc32_update(c, chunk)         // as often as you like
+//     let n = flatecheck.crc32_value(c)
+//
+// which is the same feed-and-drain discipline the decoder uses, for the
+// same reason.  `crc32_of` and `adler32_of` are the one-shot forms for
+// the caller who has the whole buffer.
+//
+// THE TWO ARE NOT INTERCHANGEABLE.  Adler-32 is far cheaper and far
+// weaker — it is a pair of running sums, and it misses short
+// transpositions a CRC catches.  That is zlib's choice, not a defect
+// this package should fix: a zlib stream whose trailer this package
+// filled with a CRC32 would be a zlib stream nothing else could read.
+
+// A CRC32 in progress: the IEEE 802.3 polynomial, reflected, as gzip,
+// PNG and ZIP all use it.
+//
+// The field is the running value in the form the algorithm carries it,
+// which is NOT the value to write into a trailer — `crc32_value`
+// applies the final complement.  It is public so the state is
+// reviewable, not because a caller should read it.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     let c = flatecheck.crc32()
+//     println("${flatecheck.crc32_value(c)}")        // 0 — the empty CRC
+// ```
+pub struct Crc32
+    // The running register, pre-complement.  A fresh one is
+    // `0xFFFFFFFF`, which is why this is not the answer.
+    running: Int
+
+// A CRC32 over nothing yet.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.crc32_value(flatecheck.crc32())}")   // 0
+// ```
+pub fn crc32() -> Crc32
+    todo("flate-nv.crc32")
+
+// Fold the next chunk in, and get back the checksum to fold the chunk
+// after it into.
+//
+// Splitting the input anywhere gives the same answer as not splitting
+// it — that is the whole property a rolling checksum has, and it is
+// what lets a decoder verify a trailer without ever holding the
+// decompressed stream.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     let c = flatecheck.crc32_update(flatecheck.crc32(), bytes.from_str("hello"))
+//     println("${flatecheck.crc32_value(c)}")
+// ```
+pub fn crc32_update(c: Crc32, data: Bytes) -> Crc32
+    todo("flate-nv.crc32_update")
+
+// The finished checksum, as the 32-bit unsigned value a trailer
+// carries.
+//
+// Always in `0 ..= 4294967295`: the complement is applied here rather
+// than in `crc32_update`, so calling this twice on the same value
+// gives the same answer and folding more data in afterwards still
+// works.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.crc32_of(bytes.from_str(""))}")      // 0
+// ```
+pub fn crc32_value(c: Crc32) -> Int
+    todo("flate-nv.crc32_value")
+
+// The CRC32 of one buffer, for the caller who has all of it.
+//
+// `crc32` + one `crc32_update` + `crc32_value`, written once here
+// instead of once per caller.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.crc32_of(bytes.from_str("hello"))}")
+// ```
+pub fn crc32_of(data: Bytes) -> Int
+    todo("flate-nv.crc32_of")
+
+// An Adler-32 in progress: RFC 1950 § 9's two running sums modulo
+// 65,521.
+//
+// Carried as the two sums rather than as the packed 32-bit value
+// because that is what the update actually works on, and packing on
+// every chunk would be arithmetic nobody asked for.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.adler32_value(flatecheck.adler32())}")   // 1
+// ```
+pub struct Adler32
+    // The sum of the bytes, plus one.  Starts at 1, which is why the
+    // empty Adler-32 is 1 and not 0.
+    lo: Int
+    // The sum of the running `lo` values.  Starts at 0.
+    hi: Int
+
+// An Adler-32 over nothing yet.
+//
+// Its value is 1, not 0 — RFC 1950 § 9 seeds `lo` at one, and a caller
+// checking for "no data" against zero would be checking for the wrong
+// number.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.adler32_value(flatecheck.adler32())}")   // 1
+// ```
+pub fn adler32() -> Adler32
+    todo("flate-nv.adler32")
+
+// Fold the next chunk in, and get back the checksum to fold the chunk
+// after it into.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     let a = flatecheck.adler32_update(flatecheck.adler32(), bytes.from_str("a"))
+//     println("${flatecheck.adler32_value(a)}")       // 0x00620062
+// ```
+pub fn adler32_update(a: Adler32, data: Bytes) -> Adler32
+    todo("flate-nv.adler32_update")
+
+// The finished checksum, as the 32-bit value a zlib trailer carries:
+// `hi * 65536 + lo`.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.adler32_of(bytes.from_str(""))}")     // 1
+// ```
+pub fn adler32_value(a: Adler32) -> Int
+    todo("flate-nv.adler32_value")
+
+// The Adler-32 of one buffer, for the caller who has all of it.
+//
+// ```novo
+// use flatecheck
+//
+// fn main() [io]
+//     println("${flatecheck.adler32_of(bytes.from_str("a"))}")
+// ```
+pub fn adler32_of(data: Bytes) -> Int
+    todo("flate-nv.adler32_of")

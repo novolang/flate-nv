@@ -1,0 +1,220 @@
+// zlib.nv — RFC 1950's two header bytes and four trailer bytes as
+// values.
+//
+// WHY SIX BYTES DESERVE A MODULE
+//
+// Because they are six bytes that are wrong in the wild constantly.
+// The zlib header packs four fields into two bytes and then requires
+// that the pair, read big-endian, be a multiple of 31 — a check
+// digit — so a hand-assembled header is usually invalid and a
+// mis-assembled one is usually silently accepted by a decoder that
+// skipped the check.  Making the header a value with named fields, one
+// parser and one emitter means the check digit is computed in one
+// place and verified in one place.
+//
+// It is also the header PNG uses (every `IDAT` chain is a zlib
+// stream), which is the second-largest reason anyone reaches for this
+// package, and PNG's own rules about the window size are stricter than
+// RFC 1950's.
+//
+// WHAT IS THE SPECIFICATION AND WHAT IS ZLIB'S CHOICE
+//
+// CM = 8, the window bits, the 31-multiple check, FDICT and the
+// big-endian Adler-32 trailer are RFC 1950 and binding.  FLEVEL is
+// specified as a field but explicitly advisory — RFC 1950 § 2.2 says a
+// decompressor may ignore it, and every one does — so this package
+// carries it, emits it and never acts on it.  That is worth saying
+// because it is the one zlib field that LOOKS like it controls
+// something.
+//
+// The endianness trap is worth saying too: zlib's trailer is
+// BIG-endian and gzip's is LITTLE-endian, in adjacent specifications
+// from the same month.  It is not a mistake in this package and it is
+// not a mistake to fix.
+
+// A zlib stream's header, RFC 1950 § 2.2.
+//
+// Three fields rather than two bytes, and the check digit is not among
+// them: it is derived on `emit` and verified on `parse`, so there is
+// no way for a caller to hold a header whose check digit is wrong.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${zlib.header().window_bits}")          // 15
+// ```
+pub struct ZlibHeader
+    // The base-2 log of the window size, `8 ..= 15`.  15 is 32 KiB and
+    // is what everything writes; a smaller value is a promise that no
+    // back-reference reaches further, which is how a decoder on a
+    // device knows how much window to allocate.
+    window_bits: Int
+    // FLEVEL, `0 ..= 3`: a hint about how hard the encoder worked.
+    // Advisory in the RFC and ignored by every decoder including this
+    // one.  Carried so that a stream this package re-emits is
+    // byte-identical to the one it parsed.
+    level_hint: Int
+    // The Adler-32 of the preset dictionary, when FDICT is set;
+    // absent otherwise.  Present means a decoder needs a dictionary
+    // it has not been given, which is `ZlibDictionaryRequired`.
+    dict_id: ?Int
+
+// A header with the ordinary settings: a 32 KiB window, a default
+// level hint, no dictionary.
+//
+// What every zlib stream in the world starts with, and what
+// `deflate.deflater` emits under `ZlibWrapped` unless told otherwise.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${bytes.len(zlib.emit(zlib.header()))}")     // 2
+// ```
+pub fn header() -> ZlibHeader
+    todo("flate-nv.zlib.header")
+
+// The header with a smaller window promised.
+//
+// `8 ..= 15`.  Anything outside is `BadZlibHeader` when the header is
+// emitted rather than here, because a builder with no error channel
+// is what makes the rest of this module chainable — and because the
+// only caller who gets this wrong is one computing the value, who
+// wants the failure where the bytes are.
+//
+// Worth setting when the consumer is a device: a decoder told 10 bits
+// allocates 1 KiB instead of 32.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${zlib.with_window_bits(zlib.header(), 10).window_bits}")    // 10
+// ```
+pub fn with_window_bits(h: ZlibHeader, bits: Int) -> ZlibHeader
+    todo("flate-nv.zlib.with_window_bits")
+
+// The header with a level hint set, `0 ..= 3`.
+//
+// Advisory: nothing reads it.  It is settable so that a stream can be
+// re-emitted exactly as it was parsed.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${zlib.with_level_hint(zlib.header(), 3).level_hint}")   // 3
+// ```
+pub fn with_level_hint(h: ZlibHeader, hint: Int) -> ZlibHeader
+    todo("flate-nv.zlib.with_level_hint")
+
+// The header with FDICT set and a dictionary identified.
+//
+// The id is the Adler-32 of the dictionary itself — that is all the
+// format carries, so it is a handle for finding a dictionary both
+// sides already agreed on, not a way to transmit one.  This package
+// does not implement preset dictionaries; it reports the requirement
+// and names the id, which is what lets a caller that does have the
+// dictionary detect the case.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     match zlib.with_dict_id(zlib.header(), 305419896).dict_id
+//         Some(_) => println("dictionary required")     // this one
+//         None    => println("none")
+// ```
+pub fn with_dict_id(h: ZlibHeader, id: Int) -> ZlibHeader
+    todo("flate-nv.zlib.with_dict_id")
+
+// Parse a header from the front of a buffer: the header, and how many
+// bytes it took — 2, or 6 when FDICT is set.
+//
+// The length is returned rather than assumed because those are the two
+// possibilities and a caller that assumed 2 would start the DEFLATE
+// stream four bytes early on every dictionary stream, producing
+// garbage rather than an error.
+//
+// `BadZlibHeader` when the method is not 8, the window is over 15, or
+// the 31-multiple check fails; `TruncatedStream` when the buffer is
+// shorter than the header.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     match zlib.parse(bytes.from_str(""))
+//         Ok(_)  => println("parsed")
+//         Err(_) => println("need more bytes")          // this one
+// ```
+pub fn parse(data: Bytes) -> Result<(ZlibHeader, Int), FlateError>
+    todo("flate-nv.zlib.parse")
+
+// The header, as the bytes that go on the wire, check digit included.
+//
+// The FCHECK bits are chosen here so that the two bytes read
+// big-endian are a multiple of 31 — that is the whole reason emitting
+// a zlib header is a function and not a two-byte literal.
+//
+// `BadZlibHeader` when a field is out of range, which is where
+// `with_window_bits` defers its validation to.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     match zlib.emit_checked(zlib.with_window_bits(zlib.header(), 99))
+//         Ok(_)  => println("emitted")
+//         Err(_) => println("window out of range")      // this one
+// ```
+pub fn emit_checked(h: ZlibHeader) -> Result<Bytes, FlateError>
+    todo("flate-nv.zlib.emit_checked")
+
+// The header's bytes for a header known to be in range.
+//
+// `emit_checked` without the result, for the header this module
+// built — every constructor here except `with_window_bits` produces a
+// header whose fields are already in range, and threading a `Result`
+// through those call sites would be ceremony over a case that cannot
+// happen.  Panics on an out-of-range header, which is a caller that
+// skipped `emit_checked` after computing a window size.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${bytes.len(zlib.emit(zlib.header()))}")     // 2
+// ```
+pub fn emit(h: ZlibHeader) -> Bytes
+    todo("flate-nv.zlib.emit")
+
+// A zlib trailer: the Adler-32 of the plaintext, four BIG-endian
+// bytes.
+//
+// Big-endian, unlike gzip's little-endian trailer four hundred words
+// away in this package.  RFC 1950 § 2.2 against RFC 1952 § 2.3.1; both
+// are right and neither is negotiable.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     println("${bytes.len(zlib.trailer(1))}")             // 4
+// ```
+pub fn trailer(adler: Int) -> Bytes
+    todo("flate-nv.zlib.trailer")
+
+// Parse a trailer at an offset: the Adler-32 it claims.
+//
+// ```novo
+// use zlib
+//
+// fn main() [io]
+//     match zlib.parse_trailer(bytes.from_str(""), 0)
+//         Ok(_)  => println("read")
+//         Err(_) => println("truncated")                // this one
+// ```
+pub fn parse_trailer(data: Bytes, offset: Int) -> Result<Int, FlateError>
+    todo("flate-nv.zlib.parse_trailer")
