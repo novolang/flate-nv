@@ -5,6 +5,26 @@ All notable changes to flate-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-10-29
+
+First implementation of the interface published as 0.0.4. Every function has a body, the package is `experimental`, and the floor is toolchain 0.22.0.
+
+### Added
+
+- The decoder reads stored, fixed and dynamic blocks in raw, zlib and gzip form, across chunk boundaries of any size, with a 32 KiB window, a size limit, a strict mode and the checksum and length checks of both containers.
+- The encoder writes stored, fixed and dynamic blocks from a hash-chain search with lazy matching, at levels 0 to 9 and under all five strategies, with `flush` as a sync flush.
+- The tests carry streams written by CPython's zlib and gzip modules at levels 0, 1, 6 and 9 (`tests/vectors.py` regenerates them), streams assembled to be wrong in one way each, and round trips through every level, container and strategy. Line coverage of `src/` is 100%.
+
+### Changed
+
+- The fields of `Inflater` and `Deflater` gained the state the implementation needs (`pending`, `final_block`, `stored_left`, `lit_code`, `dist_code` on the decoder; `window` on the encoder), and the comments on `window`, `window_at`, `bit_buf` and `bit_count` say how they are used. The structs are not meant to be built or read by a caller, and no function signature changed.
+- `flateerror.is_corrupt` is false for `TruncatedStream` and `SourceFailed` and true for every other reason, as its documentation says.
+
+### Known
+
+- A dynamic block header that declares more than 286 literal and length codes or more than 30 distance codes is reported as `BadHuffmanCode`; `FlateError` has no variant for it.
+- A preset dictionary is reported with `ZlibDictionaryRequired` and not supported. `deflate.with_zlib_header` with a dictionary identifier writes the identifier and compresses without a dictionary.
+
 ## 0.0.4 — 2026-10-25
 
 A file that names a sibling module's type, function or constant has the `use` line for that module (E2033, E2003), and the two signature illustrations in the README are fenced as illustrations.  No signature changed.

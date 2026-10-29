@@ -62,7 +62,7 @@ pub struct Crc32
 //     println("${flatecheck.crc32_value(flatecheck.crc32())}")   // 0
 // ```
 pub fn crc32() -> Crc32
-    todo("flate-nv.crc32")
+    Crc32 { running: 0xFFFFFFFF }
 
 // Fold the next chunk in, and get back the checksum to fold the chunk
 // after it into.
@@ -80,7 +80,12 @@ pub fn crc32() -> Crc32
 //     println("${flatecheck.crc32_value(c)}")
 // ```
 pub fn crc32_update(c: Crc32, data: Bytes) -> Crc32
-    todo("flate-nv.crc32_update")
+    let table = crc_table()
+    var reg = c.running
+    for i in 0..bytes.len(data)
+        let b = bytes.byte_at(data, i) ?? 0
+        reg = table[(reg ^ b) & 0xFF] ^ (reg >>> 8)
+    Crc32 { running: reg }
 
 // The finished checksum, as the 32-bit unsigned value a trailer
 // carries.
@@ -97,7 +102,7 @@ pub fn crc32_update(c: Crc32, data: Bytes) -> Crc32
 //     println("${flatecheck.crc32_of(bytes.from_str(""))}")      // 0
 // ```
 pub fn crc32_value(c: Crc32) -> Int
-    todo("flate-nv.crc32_value")
+    (c.running ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
 // The CRC32 of one buffer, for the caller who has all of it.
 //
@@ -111,7 +116,7 @@ pub fn crc32_value(c: Crc32) -> Int
 //     println("${flatecheck.crc32_of(bytes.from_str("hello"))}")
 // ```
 pub fn crc32_of(data: Bytes) -> Int
-    todo("flate-nv.crc32_of")
+    crc32_value(crc32_update(crc32(), data))
 
 // An Adler-32 in progress: RFC 1950 § 9's two running sums modulo
 // 65,521.
@@ -146,7 +151,7 @@ pub struct Adler32
 //     println("${flatecheck.adler32_value(flatecheck.adler32())}")   // 1
 // ```
 pub fn adler32() -> Adler32
-    todo("flate-nv.adler32")
+    Adler32 { lo: 1, hi: 0 }
 
 // Fold the next chunk in, and get back the checksum to fold the chunk
 // after it into.
@@ -159,7 +164,19 @@ pub fn adler32() -> Adler32
 //     println("${flatecheck.adler32_value(a)}")       // 0x00620062
 // ```
 pub fn adler32_update(a: Adler32, data: Bytes) -> Adler32
-    todo("flate-nv.adler32_update")
+    var lo = a.lo
+    var hi = a.hi
+    let n = bytes.len(data)
+    var at = 0
+    while at < n
+        let stop = min_int(at + ADLER_RUN, n)
+        for i in at..stop
+            lo = lo + (bytes.byte_at(data, i) ?? 0)
+            hi = hi + lo
+        lo = lo % ADLER_MODULUS
+        hi = hi % ADLER_MODULUS
+        at = stop
+    Adler32 { lo: lo, hi: hi }
 
 // The finished checksum, as the 32-bit value a zlib trailer carries:
 // `hi * 65536 + lo`.
@@ -171,7 +188,7 @@ pub fn adler32_update(a: Adler32, data: Bytes) -> Adler32
 //     println("${flatecheck.adler32_of(bytes.from_str(""))}")     // 1
 // ```
 pub fn adler32_value(a: Adler32) -> Int
-    todo("flate-nv.adler32_value")
+    (a.hi << 16) | a.lo
 
 // The Adler-32 of one buffer, for the caller who has all of it.
 //
@@ -182,4 +199,34 @@ pub fn adler32_value(a: Adler32) -> Int
 //     println("${flatecheck.adler32_of(bytes.from_str("a"))}")
 // ```
 pub fn adler32_of(data: Bytes) -> Int
-    todo("flate-nv.adler32_of")
+    adler32_value(adler32_update(adler32(), data))
+
+// The largest prime below 2^16, which RFC 1950 section 8.2 makes the
+// modulus of both sums.
+const ADLER_MODULUS = 65521
+
+// How many bytes are summed before the sums are reduced.  A sum of
+// 4096 bytes plus a reduced starting value stays far inside 64 bits, so
+// the reduction is deferred to once per run rather than once per byte.
+const ADLER_RUN = 4096
+
+// The smaller of two integers.
+fn min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// The 256-entry table of the reflected IEEE 802.3 polynomial
+// `0xEDB88320`: entry `n` is the remainder of the byte `n` fed least
+// significant bit first.
+fn crc_table() -> [Int]
+    var out: [Int] = []
+    for n in 0..256
+        var r = n
+        for _bit in 0..8
+            if (r & 1) == 1
+                r = (r >>> 1) ^ 0xEDB88320
+            else
+                r = r >>> 1
+        list.push(out, r)
+    out

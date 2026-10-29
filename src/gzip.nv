@@ -33,6 +33,9 @@
 // single sharpest place where the sans-IO rule shows through the
 // interface, and the README says so.
 
+use flateerror
+use flatecheck
+
 // A gzip member's header, RFC 1952 § 2.3.
 //
 // Every field is typed rather than packed into a byte array: the flag
@@ -46,8 +49,6 @@
 // fn main() [io]
 //     println("${gzip.header().mtime}")                // 0
 // ```
-use flateerror
-
 pub struct GzipHeader
     // Modification time as a Unix timestamp, or 0 for "none
     // available" (RFC 1952 § 2.3.1).  Zero is the default because a
@@ -95,7 +96,8 @@ pub struct GzipHeader
 //     println("${gzip.header().os}")                   // 255
 // ```
 pub fn header() -> GzipHeader
-    todo("flate-nv.gzip.header")
+    GzipHeader { mtime: 0, xfl: 0, os: 255, name: "", comment: "",
+                 extra: bytes.zeros(0), is_text: false, has_header_crc: false }
 
 // The header with its original file name set.
 //
@@ -114,7 +116,9 @@ pub fn header() -> GzipHeader
 //     println("${gzip.with_name(gzip.header(), "notes.txt").name}")
 // ```
 pub fn with_name(h: GzipHeader, name: Str) -> GzipHeader
-    todo("flate-nv.gzip.with_name")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: h.os, name: name,
+                 comment: h.comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with a comment set.
 //
@@ -125,7 +129,9 @@ pub fn with_name(h: GzipHeader, name: Str) -> GzipHeader
 //     println("${gzip.with_comment(gzip.header(), "built by novo-lang").comment}")
 // ```
 pub fn with_comment(h: GzipHeader, comment: Str) -> GzipHeader
-    todo("flate-nv.gzip.with_comment")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: h.os, name: h.name,
+                 comment: comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with a modification time set.
 //
@@ -141,7 +147,9 @@ pub fn with_comment(h: GzipHeader, comment: Str) -> GzipHeader
 //     println("${gzip.with_mtime(gzip.header(), 1757376000).mtime}")
 // ```
 pub fn with_mtime(h: GzipHeader, mtime: Int) -> GzipHeader
-    todo("flate-nv.gzip.with_mtime")
+    GzipHeader { mtime: mtime, xfl: h.xfl, os: h.os, name: h.name,
+                 comment: h.comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with an OS byte set.
 //
@@ -152,7 +160,9 @@ pub fn with_mtime(h: GzipHeader, mtime: Int) -> GzipHeader
 //     println("${gzip.with_os(gzip.header(), 3).os}")   // 3 — Unix
 // ```
 pub fn with_os(h: GzipHeader, os: Int) -> GzipHeader
-    todo("flate-nv.gzip.with_os")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: os, name: h.name,
+                 comment: h.comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with an FEXTRA field set.
 //
@@ -168,7 +178,9 @@ pub fn with_os(h: GzipHeader, os: Int) -> GzipHeader
 //     println("${bytes.len(h.extra)}")                  // 0
 // ```
 pub fn with_extra(h: GzipHeader, extra: Bytes) -> GzipHeader
-    todo("flate-nv.gzip.with_extra")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: h.os, name: h.name,
+                 comment: h.comment, extra: extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with the FTEXT hint set or cleared.
 //
@@ -179,7 +191,9 @@ pub fn with_extra(h: GzipHeader, extra: Bytes) -> GzipHeader
 //     println("${gzip.with_text(gzip.header(), true).is_text}")     // true
 // ```
 pub fn with_text(h: GzipHeader, is_text: Bool) -> GzipHeader
-    todo("flate-nv.gzip.with_text")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: h.os, name: h.name,
+                 comment: h.comment, extra: h.extra, is_text: is_text,
+                 has_header_crc: h.has_header_crc }
 
 // The header with the FHCRC self-check turned on or off.
 //
@@ -190,7 +204,9 @@ pub fn with_text(h: GzipHeader, is_text: Bool) -> GzipHeader
 //     println("${gzip.with_header_crc(gzip.header(), true).has_header_crc}")   // true
 // ```
 pub fn with_header_crc(h: GzipHeader, on: Bool) -> GzipHeader
-    todo("flate-nv.gzip.with_header_crc")
+    GzipHeader { mtime: h.mtime, xfl: h.xfl, os: h.os, name: h.name,
+                 comment: h.comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: on }
 
 // Parse a header from the front of a buffer: the header, and how many
 // bytes it took.
@@ -213,7 +229,58 @@ pub fn with_header_crc(h: GzipHeader, on: Bool) -> GzipHeader
 //         Err(_) => println("need more bytes")         // this one
 // ```
 pub fn parse(data: Bytes) -> Result<(GzipHeader, Int), FlateError>
-    todo("flate-nv.gzip.parse")
+    let n = bytes.len(data)
+    if n >= 1 and byte_of(data, 0) != 0x1F
+        return Err(BadGzipMagic(0, magic_seen(data)))
+    if n >= 2 and byte_of(data, 1) != 0x8B
+        return Err(BadGzipMagic(0, magic_seen(data)))
+    if n < 4
+        return Err(TruncatedStream(n))
+    if byte_of(data, 2) != 8
+        return Err(BadGzipMethod(2, byte_of(data, 2)))
+    if n < 10
+        return Err(TruncatedStream(n))
+    let flags = byte_of(data, 3)
+    var at = 10
+    var extra = bytes.zeros(0)
+    if (flags & FEXTRA) != 0
+        if n < at + 2
+            return Err(TruncatedStream(n))
+        let xlen = byte_of(data, at) | (byte_of(data, at + 1) << 8)
+        at = at + 2
+        if n < at + xlen
+            return Err(TruncatedStream(n))
+        extra = bytes.slice(data, at, at + xlen)
+        at = at + xlen
+    var name = ""
+    if (flags & FNAME) != 0
+        let end = bytes.find_byte(data, 0, at) ?? -1
+        if end < 0
+            return Err(TruncatedStream(n))
+        name = bytes.to_str(bytes.slice(data, at, end))
+        at = end + 1
+    var comment = ""
+    if (flags & FCOMMENT) != 0
+        let end = bytes.find_byte(data, 0, at) ?? -1
+        if end < 0
+            return Err(TruncatedStream(n))
+        comment = bytes.to_str(bytes.slice(data, at, end))
+        at = end + 1
+    if (flags & FHCRC) != 0
+        if n < at + 2
+            return Err(TruncatedStream(n))
+        let want = byte_of(data, at) | (byte_of(data, at + 1) << 8)
+        let got = flatecheck.crc32_of(bytes.slice(data, 0, at)) & 0xFFFF
+        if want != got
+            return Err(BadGzipHeaderCrc(at, want, got))
+        at = at + 2
+    let xfl = byte_of(data, 8)
+    let mtime = bytes.u32_le_at(data, 4) ?? 0
+    let h = GzipHeader { mtime: mtime, xfl: xfl, os: byte_of(data, 9),
+                         name: name, comment: comment, extra: extra,
+                         is_text: (flags & FTEXT) != 0,
+                         has_header_crc: (flags & FHCRC) != 0 }
+    Ok((h, at))
 
 // The header, as the bytes that go on the wire.
 //
@@ -231,7 +298,39 @@ pub fn parse(data: Bytes) -> Result<(GzipHeader, Int), FlateError>
 //     println("${bytes.len(gzip.emit(gzip.header()))}")     // 10
 // ```
 pub fn emit(h: GzipHeader) -> Bytes
-    todo("flate-nv.gzip.emit")
+    var flags = 0
+    if h.is_text
+        flags = flags | FTEXT
+    if h.has_header_crc
+        flags = flags | FHCRC
+    var extra = bytes.slice(h.extra, 0, min_len(bytes.len(h.extra), 65535))
+    if bytes.len(extra) > 0
+        flags = flags | FEXTRA
+    let name = bytes.from_str(h.name)
+    let name_len = bytes.find_byte(name, 0, 0) ?? bytes.len(name)
+    if name_len > 0
+        flags = flags | FNAME
+    let comment = bytes.from_str(h.comment)
+    let comment_len = bytes.find_byte(comment, 0, 0) ?? bytes.len(comment)
+    if comment_len > 0
+        flags = flags | FCOMMENT
+    var parts: [Bytes] = []
+    list.push(parts, bytes.concat([bytes.u8(0x1F), bytes.u8(0x8B), bytes.u8(8),
+                                   bytes.u8(flags), bytes.u32_le(h.mtime),
+                                   bytes.u8(h.xfl), bytes.u8(h.os)]))
+    if bytes.len(extra) > 0
+        list.push(parts, bytes.u16_le(bytes.len(extra)))
+        list.push(parts, bytes.clone(extra))
+    if name_len > 0
+        list.push(parts, bytes.slice(name, 0, name_len))
+        list.push(parts, bytes.u8(0))
+    if comment_len > 0
+        list.push(parts, bytes.slice(comment, 0, comment_len))
+        list.push(parts, bytes.u8(0))
+    let body = bytes.concat(parts)
+    if h.has_header_crc
+        return bytes.concat([body, bytes.u16_le(flatecheck.crc32_of(body))])
+    body
 
 // A gzip trailer: the CRC32 of the plaintext and its length modulo
 // 2^32, eight little-endian bytes.
@@ -248,7 +347,7 @@ pub fn emit(h: GzipHeader) -> Bytes
 //     println("${bytes.len(gzip.trailer(0, 0))}")           // 8
 // ```
 pub fn trailer(crc: Int, isize: Int) -> Bytes
-    todo("flate-nv.gzip.trailer")
+    bytes.concat([bytes.u32_le(crc), bytes.u32_le(isize)])
 
 // Parse a trailer at an offset: the CRC32 and the length it claims.
 //
@@ -264,4 +363,31 @@ pub fn trailer(crc: Int, isize: Int) -> Bytes
 //         Err(_) => println("truncated")               // this one
 // ```
 pub fn parse_trailer(data: Bytes, offset: Int) -> Result<(Int, Int), FlateError>
-    todo("flate-nv.gzip.parse_trailer")
+    let crc = bytes.u32_le_at(data, offset)
+    let isize = bytes.u32_le_at(data, offset + 4)
+    match (crc, isize)
+        (Some(c), Some(s)) => Ok((c, s))
+        _                  => Err(TruncatedStream(bytes.len(data)))
+
+// The FLG bits of RFC 1952 section 2.3.1.  The three reserved high bits
+// are neither read nor written.
+const FTEXT = 1
+const FHCRC = 2
+const FEXTRA = 4
+const FNAME = 8
+const FCOMMENT = 16
+
+// The byte at an offset that is known to be inside the buffer.
+fn byte_of(data: Bytes, i: Int) -> Int
+    bytes.byte_at(data, i) ?? 0
+
+// The two bytes a buffer starts with, as one 16-bit value, with a
+// missing second byte read as zero.
+fn magic_seen(data: Bytes) -> Int
+    (byte_of(data, 0) << 8) | byte_of(data, 1)
+
+// The smaller of two lengths.
+fn min_len(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b

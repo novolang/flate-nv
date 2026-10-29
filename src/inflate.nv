@@ -1,5 +1,5 @@
-// inflate.nv — the load-bearing interface: a DEFLATE decoder that
-// performs nothing.
+// inflate.nv — a DEFLATE decoder that performs nothing: it is handed
+// bytes and answers with bytes.
 //
 // THE SHAPE, AND WHY IT IS THIS ONE
 //
@@ -52,6 +52,13 @@
 // default is unbounded and `with_limit` is how a caller states one.
 // The README says so where a reader will see it.
 
+use flate
+use flateerror
+use gzip
+use zlib
+use flatecheck
+use flatehuff
+
 // A decoder between chunks.
 //
 // Opaque in practice — the fields are here so that the state is
@@ -73,34 +80,31 @@
 //     let d = inflate.inflater(RawDeflate)
 //     println("${inflate.total_in(d)}")                    // 0
 // ```
-use flate
-use flateerror
-use gzip
-use zlib
-
 pub struct Inflater
     // The container this decoder was built for, unchanged.
     format: FlateFormat
     // Where the machine is: in the container header, in a block
-    // header, in a stored block, in a fixed or dynamic block's codes,
-    // in the trailer, or done.  An `Int` rather than an enum so the
-    // whole decoder stays cheap to copy.
+    // header, in a stored block's header or body, in a dynamic block's
+    // header, in a block's codes, in the trailer, or done.  An `Int`
+    // rather than an enum so the whole decoder stays cheap to copy.
     state: Int
     // Compressed bytes consumed so far, across every `feed`.  The
     // origin every `FlateError` offset is measured from.
     consumed: Int
     // Plaintext bytes produced so far, across every `feed`.
     produced: Int
-    // The 32 KiB sliding window a back-reference copies out of, as
-    // many bytes as have been produced.
+    // The last 32 KiB of plaintext, oldest byte first, which is what
+    // a back-reference in the next chunk copies out of.  It is shorter
+    // until that many bytes have been produced.
     window: Bytes
-    // Where the next byte goes in `window`, once it has wrapped.
+    // Where the oldest byte is in `window`: always 0, because the
+    // window is stored in order.
     window_at: Int
-    // Bits pulled from the input but not yet consumed by a code, and
-    // how many of them are live — the reason a chunk boundary can fall
-    // anywhere.
+    // Bits pulled from the input but not yet consumed by a code, least
+    // significant first.  Between chunks only the bits of a partly
+    // used byte are kept here; whole bytes go back to `pending`.
     bit_buf: Int
-    // How many bits in `bit_buf` are live, `0 ..= 32`.
+    // How many bits in `bit_buf` are live, `0 ..= 7`.
     bit_count: Int
     // The running check the container demands: a CRC32 for gzip, an
     // Adler-32 for zlib, unused for raw.  Packed as its 32-bit value.
@@ -115,6 +119,18 @@ pub struct Inflater
     strict: Bool
     // The sticky failure, or absent.
     failure: ?FlateError
+    // Input bytes taken in but not yet used: the start of a code, a
+    // header or a trailer that the chunk ended inside.  The next
+    // `feed` reads them again ahead of its own chunk.
+    pending: Bytes
+    // Whether the block being decoded is the last one.
+    final_block: Bool
+    // How many bytes of the current stored block are still to come.
+    stored_left: Int
+    // The literal and length code of the current block.
+    lit_code: Huff
+    // The distance code of the current block.
+    dist_code: Huff
 
 // A decoder at the start of a stream.
 //
@@ -137,7 +153,18 @@ pub struct Inflater
 //         None    => println("ready")                      // this one
 // ```
 pub fn inflater(fmt: FlateFormat) -> Inflater
-    todo("flate-nv.inflater")
+    var check = 0
+    match fmt
+        ZlibWrapped =>
+            check = 1
+        _           =>
+            check = 0
+    Inflater { format: fmt, state: STATE_HEADER, consumed: 0, produced: 0,
+               window: bytes.zeros(0), window_at: 0, bit_buf: 0, bit_count: 0,
+               check: check, gzip_head: None, zlib_head: None, limit: -1,
+               strict: false, failure: None, pending: bytes.zeros(0),
+               final_block: false, stored_left: 0, lit_code: flatehuff.no_codes(),
+               dist_code: flatehuff.no_codes() }
 
 // Cap how much plaintext this decoder will produce.
 //
@@ -159,7 +186,18 @@ pub fn inflater(fmt: FlateFormat) -> Inflater
 //     println("${inflate.limit_of(d)}")                    // 1048576
 // ```
 pub fn with_limit(d: Inflater, cap: Int) -> Inflater
-    todo("flate-nv.with_limit")
+    var bound = cap
+    if cap < 0
+        bound = -1
+    Inflater { format: d.format, state: d.state, consumed: d.consumed,
+                 produced: d.produced, window: d.window,
+                 window_at: d.window_at, bit_buf: d.bit_buf,
+                 bit_count: d.bit_count, check: d.check,
+                 gzip_head: d.gzip_head, zlib_head: d.zlib_head,
+                 limit: bound, strict: d.strict, failure: d.failure,
+                 pending: d.pending, final_block: d.final_block,
+                 stored_left: d.stored_left, lit_code: d.lit_code,
+                 dist_code: d.dist_code }
 
 // The output bound in force, or `-1` for unbounded.
 //
@@ -171,7 +209,7 @@ pub fn with_limit(d: Inflater, cap: Int) -> Inflater
 //     println("${inflate.limit_of(inflate.inflater(RawDeflate))}")   // -1
 // ```
 pub fn limit_of(d: Inflater) -> Int
-    todo("flate-nv.limit_of")
+    d.limit
 
 // Refuse bytes after the end of the stream.
 //
@@ -192,7 +230,15 @@ pub fn limit_of(d: Inflater) -> Int
 //     println("${inflate.total_in(d)}")                    // 0
 // ```
 pub fn with_strict(d: Inflater) -> Inflater
-    todo("flate-nv.with_strict")
+    Inflater { format: d.format, state: d.state, consumed: d.consumed,
+                 produced: d.produced, window: d.window,
+                 window_at: d.window_at, bit_buf: d.bit_buf,
+                 bit_count: d.bit_count, check: d.check,
+                 gzip_head: d.gzip_head, zlib_head: d.zlib_head,
+                 limit: d.limit, strict: true, failure: d.failure,
+                 pending: d.pending, final_block: d.final_block,
+                 stored_left: d.stored_left, lit_code: d.lit_code,
+                 dist_code: d.dist_code }
 
 // Feed the next chunk; get back the decoder to feed the chunk after
 // it, and every plaintext byte those bytes produced.
@@ -222,7 +268,15 @@ pub fn with_strict(d: Inflater) -> Inflater
 //     println("${bytes.len(out)}")                         // 0
 // ```
 pub fn feed(d: Inflater, chunk: Bytes) -> (Inflater, Bytes)
-    todo("flate-nv.feed")
+    if let Some(_) = d.failure
+        return (d, bytes.zeros(0))
+    if d.state == STATE_DONE
+        if d.strict and bytes.len(chunk) > 0
+            return (failed(d, TrailingGarbage(d.consumed)), bytes.zeros(0))
+        return (d, bytes.zeros(0))
+    var c = open_cursor(d, bytes.concat([d.pending, chunk]))
+    drain(var c)
+    settle(d, var c)
 
 // End of stream: whatever the container's trailer released, and the
 // verdict.
@@ -255,7 +309,12 @@ pub fn feed(d: Inflater, chunk: Bytes) -> (Inflater, Bytes)
 //         Err(_) => println("truncated")                   // this one
 // ```
 pub fn finish(d: Inflater) -> Result<Bytes, FlateError>
-    todo("flate-nv.finish")
+    match d.failure
+        Some(f) => Err(f)
+        None    =>
+            if d.state == STATE_DONE
+                return Ok(bytes.zeros(0))
+            Err(TruncatedStream(d.consumed + bytes.len(d.pending)))
 
 // The sticky failure this decoder is carrying, or `None`.
 //
@@ -273,7 +332,7 @@ pub fn finish(d: Inflater) -> Result<Bytes, FlateError>
 //         None    => println("fine")                       // this one
 // ```
 pub fn error(d: Inflater) -> ?FlateError
-    todo("flate-nv.error")
+    d.failure
 
 // Whether the decoder has seen the end of the stream.
 //
@@ -290,7 +349,7 @@ pub fn error(d: Inflater) -> ?FlateError
 //     println("${inflate.is_done(inflate.inflater(RawDeflate))}")    // false
 // ```
 pub fn is_done(d: Inflater) -> Bool
-    todo("flate-nv.is_done")
+    d.state == STATE_DONE and d.failure == None
 
 // Compressed bytes consumed so far, across every `feed`.
 //
@@ -306,7 +365,7 @@ pub fn is_done(d: Inflater) -> Bool
 //     println("${inflate.total_in(inflate.inflater(GzipWrapped))}")  // 0
 // ```
 pub fn total_in(d: Inflater) -> Int
-    todo("flate-nv.total_in")
+    d.consumed
 
 // Plaintext bytes produced so far, across every `feed`.
 //
@@ -318,7 +377,7 @@ pub fn total_in(d: Inflater) -> Int
 //     println("${inflate.total_out(inflate.inflater(GzipWrapped))}") // 0
 // ```
 pub fn total_out(d: Inflater) -> Int
-    todo("flate-nv.total_out")
+    d.produced
 
 // The gzip header this decoder parsed, or `None`.
 //
@@ -339,7 +398,7 @@ pub fn total_out(d: Inflater) -> Int
 //         None    => println("not yet")                    // this one
 // ```
 pub fn gzip_header(d: Inflater) -> ?GzipHeader
-    todo("flate-nv.gzip_header")
+    d.gzip_head
 
 // The zlib header this decoder parsed, or `None`.
 //
@@ -357,7 +416,7 @@ pub fn gzip_header(d: Inflater) -> ?GzipHeader
 //         None    => println("raw has none")               // this one
 // ```
 pub fn zlib_header(d: Inflater) -> ?ZlibHeader
-    todo("flate-nv.zlib_header")
+    d.zlib_head
 
 // Decompress a whole buffer, checks and all.
 //
@@ -377,7 +436,10 @@ pub fn zlib_header(d: Inflater) -> ?ZlibHeader
 //         Err(_) => println("not a gzip stream")           // this one
 // ```
 pub fn decompress(data: Bytes, fmt: FlateFormat) -> Result<Bytes, FlateError>
-    todo("flate-nv.decompress")
+    let (d, out) = feed(inflater(fmt), data)
+    match finish(d)
+        Ok(tail) => Ok(bytes.concat([out, tail]))
+        Err(e)   => Err(e)
 
 // Decompress a whole stream, and be charged exactly what the stream
 // costs.
@@ -417,4 +479,519 @@ pub fn decompress(data: Bytes, fmt: FlateFormat) -> Result<Bytes, FlateError>
 //         Err(e) => println(e.message())
 // ```
 pub fn read_all<S: Read[e]>(src: S, fmt: FlateFormat) -> Result<Bytes, FlateError> [e]
-    todo("flate-nv.read_all")
+    var d = inflater(fmt)
+    var parts: [Bytes] = []
+    var reading = true
+    while reading
+        match src.read(65536)
+            Ok(chunk)  =>
+                if bytes.len(chunk) == 0
+                    reading = false
+                else
+                    let (next, out) = feed(d, chunk)
+                    d = next
+                    list.push(parts, bytes.clone(out))
+                    if let Some(f) = d.failure
+                        return Err(f)
+            Err(cause) =>
+                return Err(SourceFailed(cause))
+    match finish(d)
+        Ok(tail) =>
+            list.push(parts, bytes.clone(tail))
+            Ok(bytes.concat(parts))
+        Err(e)   => Err(e)
+
+// The states of the decoder, in the order a stream passes through them.
+const STATE_HEADER = 0
+const STATE_BLOCK = 1
+const STATE_STORED_HEAD = 2
+const STATE_STORED = 3
+const STATE_DYNAMIC = 4
+const STATE_CODES = 5
+const STATE_TRAILER = 6
+const STATE_DONE = 7
+
+// How far back a reference reaches, and so how much output a decoder
+// keeps.
+const WINDOW_SIZE = 32768
+
+// The work of one `feed`: the input in hand, the output being built and
+// the decoder's registers, all writable so that the steps below can
+// advance them in place.  `settle` turns it back into an `Inflater`.
+struct Cursor
+    src: Bytes
+    var n: Int
+    var ip: Int
+    var base: Int
+    var bb: Int
+    var bc: Int
+    var state: Int
+    var final_block: Bool
+    var stored_left: Int
+    var lit_code: Huff
+    var dist_code: Huff
+    var hist: Bytes
+    var hlen: Int
+    var start: Int
+    var outbase: Int
+    var checked: Int
+    var check: Int
+    var format: FlateFormat
+    var limit: Int
+    var gzip_head: ?GzipHeader
+    var zlib_head: ?ZlibHeader
+    var failure: ?FlateError
+
+// The same decoder with a failure recorded.
+fn failed(d: Inflater, e: FlateError) -> Inflater
+    var c = open_cursor(d, bytes.zeros(0))
+    c.failure = Some(e)
+    let (next, _out) = settle(d, var c)
+    next
+
+// A cursor over `src`, which begins with the bytes `d` was holding.
+//
+// The history buffer starts as the window and has room for the output
+// that is likely to follow; `room` makes more when it is not enough.
+fn open_cursor(d: Inflater, src: Bytes) -> Cursor
+    let wlen = bytes.len(d.window)
+    let n = bytes.len(src)
+    var hist = bytes.zeros(wlen + 4 * n + 1024)
+    bytes.copy_into(hist, 0, d.window, 0, wlen)
+    Cursor { src: src, n: n, ip: 0, base: d.consumed, bb: d.bit_buf,
+             bc: d.bit_count, state: d.state, final_block: d.final_block,
+             stored_left: d.stored_left, lit_code: d.lit_code,
+             dist_code: d.dist_code, hist: hist, hlen: wlen, start: wlen,
+             outbase: d.produced - wlen, checked: wlen, check: d.check,
+             format: d.format, limit: d.limit, gzip_head: d.gzip_head,
+             zlib_head: d.zlib_head, failure: d.failure }
+
+// The decoder a finished cursor leaves behind, with the output the
+// cursor produced.
+//
+// Whole bytes the bit buffer pulled in but did not use go back to the
+// input, so that the next chunk reads them again and the buffer holds
+// only the bits of a partly used byte.  Once the stream has ended the
+// bytes after it are not kept: they are not this decoder's.
+fn settle(d: Inflater, var c: Cursor) -> (Inflater, Bytes)
+    fold_check(var c)
+    let back = c.bc / 8
+    c.ip = c.ip - back
+    c.bc = c.bc - back * 8
+    c.bb = c.bb & ((1 << c.bc) - 1)
+    var pending = bytes.zeros(0)
+    if c.state == STATE_DONE
+        if d.strict and c.ip < c.n and c.failure == None
+            c.failure = Some(TrailingGarbage(c.base + c.ip))
+    else
+        pending = bytes.slice(c.src, c.ip, c.n)
+    var w = bytes.zeros(0)
+    if c.hlen == c.start
+        w = bytes.clone(d.window)
+    else
+        w = bytes.slice(c.hist, max_int(0, c.hlen - WINDOW_SIZE), c.hlen)
+    let next = Inflater { format: d.format, state: c.state,
+                          consumed: c.base + c.ip, produced: c.outbase + c.hlen,
+                          window: w, window_at: 0, bit_buf: c.bb,
+                          bit_count: c.bc, check: c.check,
+                          gzip_head: c.gzip_head, zlib_head: c.zlib_head,
+                          limit: d.limit, strict: d.strict,
+                          failure: c.failure, pending: pending,
+                          final_block: c.final_block,
+                          stored_left: c.stored_left, lit_code: c.lit_code,
+                          dist_code: c.dist_code }
+    (next, bytes.slice(c.hist, c.start, c.hlen))
+
+// The larger of two integers.
+fn max_int(a: Int, b: Int) -> Int
+    if a > b
+        return a
+    b
+
+// The smaller of two integers.
+fn min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// Run the machine until it needs more input, fails or reaches the end
+// of the stream.
+fn drain(var c: Cursor)
+    var running = true
+    while running
+        if c.failure != None or c.state == STATE_DONE
+            running = false
+        else
+            running = step(var c)
+
+// One step of the machine.  Answers whether it made progress, which is
+// false when it needs more input than the cursor holds.
+fn step(var c: Cursor) -> Bool
+    if c.state == STATE_HEADER
+        return step_header(var c)
+    if c.state == STATE_BLOCK
+        return step_block(var c)
+    if c.state == STATE_STORED_HEAD
+        return step_stored_head(var c)
+    if c.state == STATE_STORED
+        return step_stored(var c)
+    if c.state == STATE_DYNAMIC
+        return step_dynamic(var c)
+    if c.state == STATE_CODES
+        return step_codes(var c)
+    step_trailer(var c)
+
+// The offset in the compressed stream of the byte holding the next
+// bit.
+fn here(c: Cursor) -> Int
+    c.base + c.ip - (c.bc + 7) / 8
+
+// Record a failure.  Always answers false so that a step can end with
+// it.
+fn fail(var c: Cursor, e: FlateError) -> Bool
+    c.failure = Some(e)
+    false
+
+// Pull bytes into the bit buffer until it holds `n` bits, or the input
+// runs out.  Answers whether it holds them.  `n` is at most 48.
+fn avail(var c: Cursor, n: Int) -> Bool
+    while c.bc < n and c.ip < c.n
+        c.bb = c.bb | ((bytes.byte_at(c.src, c.ip) ?? 0) << c.bc)
+        c.bc = c.bc + 8
+        c.ip = c.ip + 1
+    c.bc >= n
+
+// Fill the bit buffer as far as the input allows.
+fn refill(var c: Cursor)
+    while c.bc <= 48 and c.ip < c.n
+        c.bb = c.bb | ((bytes.byte_at(c.src, c.ip) ?? 0) << c.bc)
+        c.bc = c.bc + 8
+        c.ip = c.ip + 1
+
+// Remove `n` bits from the bit buffer and answer them.  The buffer
+// must hold them.
+fn take(var c: Cursor, n: Int) -> Int
+    let v = c.bb & ((1 << n) - 1)
+    c.bb = c.bb >>> n
+    c.bc = c.bc - n
+    v
+
+// Drop the bits left in a partly used byte, and hand every whole byte
+// in the bit buffer back to the input, so that the next read is byte
+// aligned and starts at `ip`.
+fn align(var c: Cursor)
+    c.ip = c.ip - c.bc / 8
+    c.bb = 0
+    c.bc = 0
+
+// Make room for `k` more bytes of output.  Answers false, with the
+// failure recorded, when that would pass the limit.
+fn room(var c: Cursor, k: Int) -> Bool
+    if c.limit >= 0 and c.outbase + c.hlen + k > c.limit
+        return fail(var c, OutputTooLarge(here(c), c.limit))
+    if c.hlen + k > bytes.len(c.hist)
+        var bigger = bytes.zeros(max_int(2 * bytes.len(c.hist), c.hlen + k))
+        bytes.copy_into(bigger, 0, c.hist, 0, c.hlen)
+        c.hist = bigger
+    true
+
+// Fold the output produced since the last call into the container's
+// check.
+fn fold_check(var c: Cursor)
+    if c.hlen > c.checked
+        let seg = bytes.slice(c.hist, c.checked, c.hlen)
+        match c.format
+            GzipWrapped =>
+                let crc = Crc32 { running: c.check ^ 0xFFFFFFFF }
+                c.check = flatecheck.crc32_value(flatecheck.crc32_update(crc, seg))
+            ZlibWrapped =>
+                let sums = Adler32 { lo: c.check & 0xFFFF, hi: c.check >>> 16 }
+                c.check = flatecheck.adler32_value(flatecheck.adler32_update(sums, seg))
+            RawDeflate  =>
+                c.check = 0
+        c.checked = c.hlen
+
+// The container header.  It is read from the start of the input, which
+// is where the input starts for as long as the machine is in this state.
+fn step_header(var c: Cursor) -> Bool
+    match c.format
+        RawDeflate  =>
+            c.state = STATE_BLOCK
+            true
+        ZlibWrapped =>
+            match zlib.parse(c.src)
+                Ok((h, len))            =>
+                    if let Some(id) = h.dict_id
+                        return fail(var c, ZlibDictionaryRequired(c.base + 2, id))
+                    c.zlib_head = Some(h)
+                    c.ip = len
+                    c.state = STATE_BLOCK
+                    true
+                Err(TruncatedStream(_)) => false
+                Err(e)                  => fail(var c, e)
+        GzipWrapped =>
+            match gzip.parse(c.src)
+                Ok((h, len))            =>
+                    c.gzip_head = Some(h)
+                    c.ip = len
+                    c.state = STATE_BLOCK
+                    true
+                Err(TruncatedStream(_)) => false
+                Err(e)                  => fail(var c, e)
+
+// A block header: the final flag and the two bits of the type.
+fn step_block(var c: Cursor) -> Bool
+    if not avail(var c, 3)
+        return false
+    let at = here(c)
+    let head = take(var c, 3)
+    c.final_block = (head & 1) == 1
+    let kind = head >>> 1
+    if kind == 0
+        align(var c)
+        c.state = STATE_STORED_HEAD
+        return true
+    if kind == 1
+        c.lit_code = flatehuff.fixed_lit()
+        c.dist_code = flatehuff.fixed_dist()
+        c.state = STATE_CODES
+        return true
+    if kind == 2
+        c.state = STATE_DYNAMIC
+        return true
+    fail(var c, BadBlockType(at))
+
+// The length of a stored block and its complement.
+fn step_stored_head(var c: Cursor) -> Bool
+    if c.n - c.ip < 4
+        return false
+    let len = bytes.u16_le_at(c.src, c.ip) ?? 0
+    let nlen = bytes.u16_le_at(c.src, c.ip + 2) ?? 0
+    if len != (nlen ^ 0xFFFF)
+        return fail(var c, BadStoredLength(c.base + c.ip, len, nlen))
+    c.ip = c.ip + 4
+    c.stored_left = len
+    c.state = STATE_STORED
+    true
+
+// The bytes of a stored block, as many as the input holds.
+fn step_stored(var c: Cursor) -> Bool
+    if c.stored_left > 0
+        let k = min_int(c.stored_left, c.n - c.ip)
+        if k == 0
+            return false
+        if not room(var c, k)
+            return false
+        bytes.copy_into(c.hist, c.hlen, c.src, c.ip, k)
+        c.hlen = c.hlen + k
+        c.ip = c.ip + k
+        c.stored_left = c.stored_left - k
+        if c.stored_left > 0
+            return false
+    end_block(var c)
+    true
+
+// The end of a block: the next block header, or the trailer.
+fn end_block(var c: Cursor)
+    if not c.final_block
+        c.state = STATE_BLOCK
+        return
+    align(var c)
+    match c.format
+        RawDeflate =>
+            c.state = STATE_DONE
+        _          =>
+            c.state = STATE_TRAILER
+
+// The header of a dynamic block: how many codes of each alphabet there
+// are, the code lengths of the code-length alphabet, and then the code
+// lengths of the literal and length alphabet and the distance alphabet
+// coded by it.  The header is read whole or not at all, so that a chunk
+// boundary inside it costs a second read of the header and not a state
+// of its own.
+fn step_dynamic(var c: Cursor) -> Bool
+    let saved_bb = c.bb
+    let saved_bc = c.bc
+    let saved_ip = c.ip
+    let at = here(c)
+    if not avail(var c, 14)
+        return rewind(var c, saved_bb, saved_bc, saved_ip)
+    let nlen = take(var c, 5) + 257
+    let ndist = take(var c, 5) + 1
+    let ncode = take(var c, 4) + 4
+    if nlen > 286 or ndist > 30
+        return fail(var c, BadHuffmanCode(at))
+    var clens: [Int] = list.zeros(19)
+    for i in 0..ncode
+        if not avail(var c, 3)
+            return rewind(var c, saved_bb, saved_bc, saved_ip)
+        clens[flatehuff.CLEN_ORDER[i]] = take(var c, 3)
+    let cl = flatehuff.construct(clens, 0, 19)
+    if cl.left != 0
+        return fail(var c, IncompleteHuffmanTable(at, cl.culprit))
+    let total = nlen + ndist
+    var lens: [Int] = list.zeros(total)
+    var idx = 0
+    while idx < total
+        refill(var c)
+        let got = flatehuff.decode(cl.table, c.bb, c.bc)
+        if got == flatehuff.NEED_BITS
+            return rewind(var c, saved_bb, saved_bc, saved_ip)
+        // The code-length code is complete, so every bit pattern is a
+        // code and `NO_CODE` cannot occur here.
+        let sym = got & 0xFFFF
+        discard(var c, got >>> 16)
+        if sym < 16
+            lens[idx] = sym
+            idx = idx + 1
+        else
+            var extra = 2
+            var base = 3
+            var value = 0
+            if sym == 17
+                extra = 3
+            if sym == 18
+                extra = 7
+                base = 11
+            if sym == 16 and idx == 0
+                return fail(var c, BadHuffmanCode(at))
+            if sym == 16
+                value = lens[idx - 1]
+            if not avail(var c, extra)
+                return rewind(var c, saved_bb, saved_bc, saved_ip)
+            let run = base + take(var c, extra)
+            if idx + run > total
+                return fail(var c, BadHuffmanCode(at))
+            for _k in 0..run
+                lens[idx] = value
+                idx = idx + 1
+    if lens[256] == 0
+        return fail(var c, IncompleteHuffmanTable(at, 256))
+    let lit = flatehuff.construct(lens, 0, nlen)
+    if not flatehuff.usable(lit, nlen)
+        return fail(var c, IncompleteHuffmanTable(at, lit.culprit))
+    let dst = flatehuff.construct(lens, nlen, ndist)
+    if not flatehuff.usable(dst, ndist)
+        return fail(var c, IncompleteHuffmanTable(at, dst.culprit))
+    c.lit_code = lit.table
+    c.dist_code = dst.table
+    c.state = STATE_CODES
+    true
+
+// Undo what a step read, because the input ended inside it.  Always
+// false.
+fn rewind(var c: Cursor, bb: Int, bc: Int, ip: Int) -> Bool
+    c.bb = bb
+    c.bc = bc
+    c.ip = ip
+    false
+
+// Remove `n` bits already known to be present.
+fn discard(var c: Cursor, n: Int)
+    c.bb = c.bb >>> n
+    c.bc = c.bc - n
+
+// What `one_code` answers: another code may follow, the block ended, or
+// the input ran out or was refused.
+const CODE_MORE = 0
+const CODE_END = 1
+const CODE_STOP = 2
+
+// The codes of a block: literals, back-references and the end of the
+// block.  A code whose bits are not all in hand is left for the next
+// chunk, with the bit buffer put back as it was before the code.
+fn step_codes(var c: Cursor) -> Bool
+    var status = CODE_MORE
+    while status == CODE_MORE
+        status = one_code(var c)
+    status == CODE_END
+
+// One literal, one back-reference or the end of the block.
+fn one_code(var c: Cursor) -> Int
+    refill(var c)
+    let saved_bb = c.bb
+    let saved_bc = c.bc
+    let got = flatehuff.decode(c.lit_code, c.bb, c.bc)
+    if got == flatehuff.NEED_BITS
+        rewind(var c, saved_bb, saved_bc, c.ip)
+        return CODE_STOP
+    if got == flatehuff.NO_CODE
+        fail(var c, BadHuffmanCode(here(c)))
+        return CODE_STOP
+    discard(var c, got >>> 16)
+    let sym = got & 0xFFFF
+    if sym < 256
+        if not room(var c, 1)
+            return CODE_STOP
+        bytes.set_u8(c.hist, c.hlen, sym)
+        c.hlen = c.hlen + 1
+        return CODE_MORE
+    if sym == 256
+        end_block(var c)
+        return CODE_END
+    if step_match(var c, sym - 257, saved_bb, saved_bc)
+        return CODE_MORE
+    CODE_STOP
+
+// A length and distance pair whose length code is `code`.  Answers
+// false when the input ends inside the pair, in which case the bit
+// buffer is put back to `bb` and `bc`, or when the pair is invalid.
+fn step_match(var c: Cursor, code: Int, bb: Int, bc: Int) -> Bool
+    if code > 28
+        return fail(var c, BadHuffmanCode(here(c)))
+    let lextra = flatehuff.len_extra(code)
+    if c.bc < lextra
+        return rewind(var c, bb, bc, c.ip)
+    let length = flatehuff.len_base(code) + take(var c, lextra)
+    let got = flatehuff.decode(c.dist_code, c.bb, c.bc)
+    if got == flatehuff.NEED_BITS
+        return rewind(var c, bb, bc, c.ip)
+    if got == flatehuff.NO_CODE
+        return fail(var c, BadHuffmanCode(here(c)))
+    discard(var c, got >>> 16)
+    let dsym = got & 0xFFFF
+    if dsym > 29
+        return fail(var c, BadHuffmanCode(here(c)))
+    let dextra = flatehuff.dist_extra(dsym)
+    if c.bc < dextra
+        return rewind(var c, bb, bc, c.ip)
+    let dist = flatehuff.dist_base(dsym) + take(var c, dextra)
+    if dist > c.hlen
+        return fail(var c, BadDistance(here(c), dist, c.outbase + c.hlen))
+    if not room(var c, length)
+        return false
+    let from = c.hlen - dist
+    if dist >= length
+        bytes.copy_within(c.hist, c.hlen, from, length)
+    else
+        for k in 0..length
+            bytes.set_u8(c.hist, c.hlen + k, bytes.byte_at(c.hist, from + k) ?? 0)
+    c.hlen = c.hlen + length
+    true
+
+// The trailer: the check of the plaintext, and for gzip its length.
+fn step_trailer(var c: Cursor) -> Bool
+    align(var c)
+    fold_check(var c)
+    match c.format
+        ZlibWrapped =>
+            match zlib.parse_trailer(c.src, c.ip)
+                Err(_)   => false
+                Ok(want) =>
+                    if want != c.check
+                        return fail(var c, ChecksumMismatch(c.base + c.ip, want, c.check))
+                    c.ip = c.ip + 4
+                    c.state = STATE_DONE
+                    true
+        _           =>
+            match gzip.parse_trailer(c.src, c.ip)
+                Err(_)            => false
+                Ok((want, isize)) =>
+                    if want != c.check
+                        return fail(var c, ChecksumMismatch(c.base + c.ip, want, c.check))
+                    let made = (c.outbase + c.hlen) & 0xFFFFFFFF
+                    if isize != made
+                        return fail(var c, GzipLengthMismatch(c.base + c.ip + 4, isize, made))
+                    c.ip = c.ip + 8
+                    c.state = STATE_DONE
+                    true

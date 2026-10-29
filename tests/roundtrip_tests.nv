@@ -1,0 +1,312 @@
+// roundtrip_tests.nv — what the encoder writes, the decoder reads, at
+// every level, in every container, under every strategy, and cut into
+// pieces every way the streaming calls allow.
+//
+// The same encoder output has been read back by zlib while the package
+// was written; the correctness condition in the README is that zlib
+// inflates what this deflates, and this suite is the part of it that
+// needs no other program.
+
+use std.test
+use flate
+use flateerror
+use deflate
+use inflate
+use gzip
+use zlib
+
+fn noise(n: Int, seed: Int, mask: Int) -> Bytes
+    var x = seed
+    var b = bytes.zeros(n)
+    for i in 0..n
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+        bytes.set_u8(b, i, (x >> 16) & 0xff & mask)
+    b
+
+fn prose(n: Int) -> Bytes
+    let t = bytes.from_str("Sphinx of black quartz, judge my vow. The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. ")
+    var parts: [Bytes] = []
+    var total = 0
+    while total < n
+        list.push(parts, bytes.clone(t))
+        total = total + bytes.len(t)
+    bytes.slice(bytes.concat(parts), 0, n)
+
+// Byte k occurs as many times as the k-th Fibonacci number, which is
+// the frequency table that makes a Huffman tree as deep as it can be.
+fn fibonacci_counts() -> Bytes
+    var parts: [Bytes] = []
+    var a = 1
+    var b = 1
+    for k in 0..22
+        list.push(parts, bytes.fill(bytes.zeros(a), 0, a, k))
+        let next = a + b
+        a = b
+        b = next
+    bytes.concat(parts)
+
+fn strategy(i: Int) -> FlateStrategy
+    if i == 0
+        return FlateDefault
+    if i == 1
+        return FlateFiltered
+    if i == 2
+        return FlateHuffmanOnly
+    if i == 3
+        return FlateRle
+    FlateFixed
+
+fn container(i: Int) -> FlateFormat
+    if i == 0
+        return RawDeflate
+    if i == 1
+        return ZlibWrapped
+    GzipWrapped
+
+fn level_of(n: Int) -> FlateLevel
+    match flate.level(n)
+        Ok(l)  => l
+        Err(_) => flate.balanced()
+
+fn corpus() -> [Bytes]
+    let far = noise(30000, 8, 255)
+    let exact = noise(32768, 7, 255)
+    [bytes.zeros(0), bytes.from_str("a"), bytes.from_str("ab"),
+     bytes.from_str("abcabcabc"), prose(3000), noise(5000, 1, 255),
+     bytes.zeros(70000), noise(20000, 3, 3), fibonacci_counts(),
+     bytes.concat([far, far]), bytes.concat([exact, exact]),
+     bytes.concat([bytes.from_str("xyz"), noise(5000, 4, 255), bytes.from_str("xyz")]),
+     bytes.concat([prose(4000), noise(3000, 5, 255), prose(9000)])]
+
+fn same(r: Result<Bytes, FlateError>, want: Bytes) -> Bool
+    match r
+        Ok(got) => got == want
+        Err(_)  => false
+
+@test
+fn test_every_level_and_container_round_trips() [io]
+    for data in corpus()
+        for lv in 0..=9
+            for c in 0..3
+                let packed = deflate.compress(data, container(c), level_of(lv))
+                test.case("${bytes.len(data)} bytes, level ${lv}, container ${c}")
+                test.assert(same(inflate.decompress(packed, container(c)), data))
+
+@test
+fn test_every_strategy_round_trips() [io]
+    for data in corpus()
+        for st in 0..5
+            let e = deflate.with_strategy(deflate.deflater(RawDeflate, flate.balanced()), strategy(st))
+            let (e2, body) = deflate.push(e, data)
+            let (_, tail) = deflate.finish(e2)
+            test.case("${bytes.len(data)} bytes, strategy ${st}")
+            test.assert(same(inflate.decompress(bytes.concat([body, tail]), RawDeflate), data))
+
+@test
+fn test_the_ratio_is_reasonable() [io]
+    let text = prose(30000)
+    let packed = deflate.compress(text, RawDeflate, flate.balanced())
+    test.assert(bytes.len(packed) < 600)
+    let runs = deflate.compress(bytes.zeros(100000), RawDeflate, flate.balanced())
+    test.assert(bytes.len(runs) < 200)
+    let random = deflate.compress(noise(10000, 2, 255), RawDeflate, flate.balanced())
+    test.assert(bytes.len(random) < 10100)
+    let skew = deflate.compress(noise(20000, 3, 3), RawDeflate, flate.balanced())
+    test.assert(bytes.len(skew) < 6500)
+
+@test
+fn test_a_higher_level_is_never_far_worse() [io]
+    let data = bytes.concat([prose(4000), noise(3000, 5, 255), prose(9000)])
+    let fast = bytes.len(deflate.compress(data, RawDeflate, flate.fastest()))
+    let best = bytes.len(deflate.compress(data, RawDeflate, flate.smallest()))
+    test.assert(best <= fast + 50)
+
+@test
+fn test_level_zero_stores() [io]
+    let data = prose(100)
+    let packed = deflate.compress(data, RawDeflate, flate.stored())
+    test.assert(bytes.len(packed) == 100 + 5)
+    test.assert((bytes.byte_at(packed, 0) ?? 9) == 1)
+
+@test
+fn test_an_empty_stream_is_the_smallest_valid_one() [io]
+    test.assert_eq_str(bytes.to_hex(deflate.compress(bytes.zeros(0), RawDeflate, flate.balanced())), "0300")
+    test.assert_eq_str(bytes.to_hex(deflate.compress(bytes.zeros(0), RawDeflate, flate.stored())), "010000ffff")
+    test.assert_eq_str(bytes.to_hex(deflate.compress(bytes.zeros(0), ZlibWrapped, flate.balanced())),
+        "789c030000000001")
+
+@test
+fn test_the_output_is_a_function_of_the_input() [io]
+    let data = prose(5000)
+    test.assert(deflate.compress(data, GzipWrapped, flate.balanced()) == deflate.compress(data, GzipWrapped, flate.balanced()))
+
+fn pieces(data: Bytes, step: Int, flush_each: Bool, l: FlateLevel) -> Bytes
+    var e = deflate.deflater(RawDeflate, l)
+    var parts: [Bytes] = []
+    var at = 0
+    let n = bytes.len(data)
+    while at < n
+        var to = at + step
+        if to > n
+            to = n
+        let (e2, out) = deflate.push(e, bytes.slice(data, at, to))
+        e = e2
+        list.push(parts, bytes.clone(out))
+        if flush_each
+            let (e3, out3) = deflate.flush(e)
+            e = e3
+            list.push(parts, bytes.clone(out3))
+        at = to
+    let (_, tail) = deflate.finish(e)
+    list.push(parts, bytes.clone(tail))
+    bytes.concat(parts)
+
+@test
+fn test_pushing_in_pieces_round_trips() [io]
+    let data = bytes.concat([prose(4000), noise(3000, 5, 255), prose(9000)])
+    for step in [1, 7, 500, 20000, 100000]
+        if step > 1 or bytes.len(data) < 20000
+            test.case("pieces of ${step}")
+            test.assert(same(inflate.decompress(pieces(data, step, false, flate.balanced()), RawDeflate), data))
+    test.case("a flush after every piece")
+    for step in [333, 5000, 65535, 70000]
+        for lv in [0, 1, 6]
+            test.assert(same(inflate.decompress(pieces(data, step, true, level_of(lv)), RawDeflate), data))
+
+@test
+fn test_a_flush_makes_everything_so_far_decodable() [io]
+    let e = deflate.deflater(RawDeflate, flate.balanced())
+    let (e1, a) = deflate.push(e, bytes.from_str("hello, hello, hello"))
+    let (e2, b) = deflate.flush(e1)
+    let (d, out) = inflate.feed(inflate.inflater(RawDeflate), bytes.concat([a, b]))
+    test.assert(out == bytes.from_str("hello, hello, hello"))
+    test.assert(inflate.is_done(d) == false)
+    match inflate.error(d)
+        None    => test.assert(true)
+        Some(_) => test.fail("a flushed stream is not a failed one")
+    let (e3, c) = deflate.flush(e2)
+    test.assert(bytes.len(c) == 5)
+    let (_, tail) = deflate.finish(e3)
+    let (d2, more) = inflate.feed(d, bytes.concat([c, tail]))
+    test.assert(bytes.len(more) == 0)
+    test.assert(inflate.is_done(d2))
+
+@test
+fn test_a_finished_encoder_does_nothing_more() [io]
+    let e = deflate.deflater(GzipWrapped, flate.balanced())
+    let (e1, tail) = deflate.finish(e)
+    test.assert(deflate.is_done(e1))
+    test.assert(bytes.len(tail) > 0)
+    let (e2, a) = deflate.push(e1, bytes.from_str("late"))
+    let (e3, b) = deflate.flush(e2)
+    let (e4, c) = deflate.finish(e3)
+    test.assert(bytes.len(a) + bytes.len(b) + bytes.len(c) == 0)
+    test.assert(deflate.total_in(e4) == 0)
+    test.assert(deflate.total_out(e4) == bytes.len(tail))
+
+@test
+fn test_the_counters_follow_the_calls() [io]
+    let e = deflate.deflater(ZlibWrapped, flate.balanced())
+    let (e1, a) = deflate.push(e, prose(1000))
+    test.assert(deflate.total_in(e1) == 1000)
+    test.assert(deflate.total_out(e1) == bytes.len(a))
+    let (e2, b) = deflate.finish(e1)
+    test.assert(deflate.total_out(e2) == bytes.len(a) + bytes.len(b))
+
+@test
+fn test_a_large_push_leaves_less_than_a_block_held() [io]
+    let (e, out) = deflate.push(deflate.deflater(RawDeflate, flate.fastest()), prose(70000))
+    test.assert(bytes.len(out) > 0)
+    test.assert(deflate.total_in(e) == 70000)
+    let (e2, exact) = deflate.push(deflate.deflater(RawDeflate, flate.fastest()), prose(65535))
+    test.assert(bytes.len(exact) > 0)
+    test.assert(deflate.total_in(e2) == 65535)
+
+@test
+fn test_a_gzip_header_set_before_the_first_push_is_written() [io]
+    let h = gzip.with_mtime(gzip.with_name(gzip.header(), "notes.txt"), 99)
+    let e = deflate.with_gzip_header(deflate.deflater(GzipWrapped, flate.balanced()), h)
+    let (e1, a) = deflate.push(e, bytes.from_str("body"))
+    let (_, b) = deflate.finish(e1)
+    let (d, out) = inflate.feed(inflate.inflater(GzipWrapped), bytes.concat([a, b]))
+    test.assert(out == bytes.from_str("body"))
+    match inflate.gzip_header(d)
+        Some(back) =>
+            test.assert(back.name == "notes.txt")
+            test.assert(back.mtime == 99)
+        None       => test.fail("no header")
+
+@test
+fn test_a_header_set_after_the_first_push_is_not() [io]
+    let e = deflate.deflater(GzipWrapped, flate.balanced())
+    let (e1, a) = deflate.push(e, bytes.from_str("body"))
+    let e2 = deflate.with_gzip_header(e1, gzip.with_name(gzip.header(), "late.txt"))
+    let (_, b) = deflate.finish(e2)
+    let (d, _) = inflate.feed(inflate.inflater(GzipWrapped), bytes.concat([a, b]))
+    match inflate.gzip_header(d)
+        Some(back) => test.assert(back.name == "")
+        None       => test.fail("no header")
+
+@test
+fn test_the_default_headers_name_the_level() [io]
+    let fast = deflate.compress(bytes.zeros(0), GzipWrapped, flate.fastest())
+    let best = deflate.compress(bytes.zeros(0), GzipWrapped, flate.smallest())
+    let mid = deflate.compress(bytes.zeros(0), GzipWrapped, flate.balanced())
+    test.assert((bytes.byte_at(fast, 8) ?? 9) == 4)
+    test.assert((bytes.byte_at(best, 8) ?? 9) == 2)
+    test.assert((bytes.byte_at(mid, 8) ?? 9) == 0)
+    test.assert_eq_str(bytes.to_hex(bytes.slice(deflate.compress(bytes.zeros(0), ZlibWrapped, flate.stored()), 0, 2)),
+        "7801")
+    test.assert_eq_str(bytes.to_hex(bytes.slice(deflate.compress(bytes.zeros(0), ZlibWrapped, level_of(3)), 0, 2)),
+        "785e")
+    test.assert_eq_str(bytes.to_hex(bytes.slice(deflate.compress(bytes.zeros(0), ZlibWrapped, flate.smallest()), 0, 2)),
+        "78da")
+
+@test
+fn test_a_small_zlib_window_is_respected() [io]
+    let h = zlib.with_window_bits(zlib.header(), 9)
+    let e = deflate.with_zlib_header(deflate.deflater(ZlibWrapped, flate.balanced()), h)
+    let data = bytes.concat([noise(700, 6, 255), noise(700, 6, 255)])
+    let (e1, a) = deflate.push(e, data)
+    let (_, b) = deflate.finish(e1)
+    let whole = bytes.concat([a, b])
+    test.assert(same(inflate.decompress(whole, ZlibWrapped), data))
+    test.assert(bytes.len(whole) > 1400)
+
+@test
+fn test_a_dictionary_header_is_written_and_then_demanded() [io]
+    let h = zlib.with_dict_id(zlib.header(), 77)
+    let e = deflate.with_zlib_header(deflate.deflater(ZlibWrapped, flate.balanced()), h)
+    let (e1, a) = deflate.push(e, bytes.from_str("x"))
+    let (_, b) = deflate.finish(e1)
+    match inflate.decompress(bytes.concat([a, b]), ZlibWrapped)
+        Err(ZlibDictionaryRequired(2, 77)) => test.assert(true)
+        _                                  => test.fail("expected ZlibDictionaryRequired")
+
+@test
+fn test_the_decoder_follows_the_encoder_across_blocks() [io]
+    let data = bytes.concat([prose(50000), noise(2000, 9, 255), prose(90000)])
+    let packed = deflate.compress(data, GzipWrapped, flate.balanced())
+    for step in [1000, 4096, 65536]
+        var d = inflate.inflater(GzipWrapped)
+        var parts: [Bytes] = []
+        var at = 0
+        while at < bytes.len(packed)
+            var to = at + step
+            if to > bytes.len(packed)
+                to = bytes.len(packed)
+            let (d2, out) = inflate.feed(d, bytes.slice(packed, at, to))
+            d = d2
+            list.push(parts, bytes.clone(out))
+            at = to
+        test.case("fed in pieces of ${step}")
+        test.assert(inflate.is_done(d))
+        test.assert(bytes.concat(parts) == data)
+
+@test
+fn test_a_header_set_after_the_first_zlib_push_is_not_written() [io]
+    let e = deflate.deflater(ZlibWrapped, flate.balanced())
+    let (e1, a) = deflate.push(e, bytes.from_str("body"))
+    let e2 = deflate.with_zlib_header(e1, zlib.with_dict_id(zlib.header(), 5))
+    let (_, b) = deflate.finish(e2)
+    test.assert(same(inflate.decompress(bytes.concat([a, b]), ZlibWrapped), bytes.from_str("body")))

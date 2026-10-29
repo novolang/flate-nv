@@ -1,0 +1,169 @@
+// headers_tests.nv — the gzip and zlib headers: every field written and
+// read back, and every way the front of a member can be wrong.
+
+use std.test
+use gzip
+use zlib
+use flateerror
+
+fn full_header() -> GzipHeader
+    var h = gzip.with_name(gzip.header(), "notes.txt")
+    h = gzip.with_comment(h, "kept")
+    h = gzip.with_mtime(h, 1757376000)
+    h = gzip.with_os(h, 3)
+    h = gzip.with_extra(h, bytes.from_str("AB\x02\x00xy"))
+    h = gzip.with_text(h, true)
+    gzip.with_header_crc(h, true)
+
+@test
+fn test_a_full_gzip_header_round_trips() [io]
+    let h = full_header()
+    let wire = gzip.emit(h)
+    match gzip.parse(wire)
+        Err(e)          => test.fail(e.message())
+        Ok((back, len)) =>
+            test.assert(len == bytes.len(wire))
+            test.assert(back.name == "notes.txt")
+            test.assert(back.comment == "kept")
+            test.assert(back.mtime == 1757376000)
+            test.assert(back.os == 3)
+            test.assert(back.extra == bytes.from_str("AB\x02\x00xy"))
+            test.assert(back.is_text)
+            test.assert(back.has_header_crc)
+
+@test
+fn test_the_flag_byte_follows_the_fields() [io]
+    test.assert((bytes.byte_at(gzip.emit(full_header()), 3) ?? 0) == 31)
+    test.assert((bytes.byte_at(gzip.emit(gzip.header()), 3) ?? 9) == 0)
+
+@test
+fn test_parse_reports_the_length_when_bytes_follow() [io]
+    let wire = bytes.concat([gzip.emit(gzip.header()), bytes.from_str("body")])
+    match gzip.parse(wire)
+        Ok((_, len)) => test.assert(len == 10)
+        Err(_)       => test.fail("a ten byte header followed by data did not parse")
+
+@test
+fn test_emit_keeps_a_name_with_a_nul_to_the_nul() [io]
+    let h = gzip.with_comment(gzip.with_name(gzip.header(), "a\x00b"), "c\x00d")
+    match gzip.parse(gzip.emit(h))
+        Ok((back, _)) =>
+            test.assert(back.name == "a")
+            test.assert(back.comment == "c")
+        Err(_)        => test.fail("did not parse")
+
+@test
+fn test_emit_keeps_an_extra_field_to_its_limit() [io]
+    let big = bytes.zeros(70000)
+    let h = gzip.with_extra(gzip.header(), big)
+    match gzip.parse(gzip.emit(h))
+        Ok((back, _)) => test.assert(bytes.len(back.extra) == 65535)
+        Err(_)        => test.fail("did not parse")
+
+@test
+fn test_every_cut_of_a_full_header_is_a_truncation() [io]
+    let wire = gzip.emit(full_header())
+    for cut in 0..bytes.len(wire)
+        match gzip.parse(bytes.slice(wire, 0, cut))
+            Err(TruncatedStream(off)) => test.assert(off == cut)
+            Err(_)                    => test.fail("cut ${cut} refused for another reason")
+            Ok(_)                     => test.fail("cut ${cut} parsed")
+
+@test
+fn test_a_wrong_first_byte_is_named_at_once() [io]
+    match gzip.parse(bytes.from_str("P"))
+        Err(BadGzipMagic(0, saw)) => test.assert(saw == 0x5000)
+        _                         => test.fail("expected BadGzipMagic")
+    match gzip.parse(bytes.from_str("\x1f\x00"))
+        Err(BadGzipMagic(0, saw)) => test.assert(saw == 0x1f00)
+        _                         => test.fail("expected BadGzipMagic")
+
+@test
+fn test_a_method_other_than_deflate_is_refused() [io]
+    match gzip.parse(bytes.from_str("\x1f\x8b\x07\x00\x00\x00\x00\x00\x00\x00"))
+        Err(BadGzipMethod(2, 7)) => test.assert(true)
+        _                        => test.fail("expected BadGzipMethod")
+
+@test
+fn test_a_damaged_header_fails_its_own_crc() [io]
+    let wire = gzip.emit(full_header())
+    let at = bytes.len(wire) - 2
+    let bad = bytes.set_u8(bytes.clone(wire), at, (bytes.byte_at(wire, at) ?? 0) ^ 1)
+    match gzip.parse(bad)
+        Err(BadGzipHeaderCrc(off, want, got)) =>
+            test.assert(off == at)
+            test.assert(want != got)
+        _                                     => test.fail("expected BadGzipHeaderCrc")
+
+@test
+fn test_a_gzip_trailer_is_read_at_an_offset() [io]
+    let wire = bytes.concat([bytes.from_str("xy"), gzip.trailer(7, 9)])
+    match gzip.parse_trailer(wire, 2)
+        Ok((7, 9)) => test.assert(true)
+        _          => test.fail("trailer not read at an offset")
+    match gzip.parse_trailer(wire, 3)
+        Err(TruncatedStream(off)) => test.assert(off == bytes.len(wire))
+        _                         => test.fail("expected a truncation")
+
+@test
+fn test_the_zlib_header_round_trips_each_window() [io]
+    for bits in 8..=15
+        for hint in 0..=3
+            let h = zlib.with_level_hint(zlib.with_window_bits(zlib.header(), bits), hint)
+            match zlib.parse(zlib.emit(h))
+                Ok((back, 2)) =>
+                    test.assert(back.window_bits == bits)
+                    test.assert(back.level_hint == hint)
+                _             => test.fail("window ${bits} hint ${hint}")
+
+@test
+fn test_the_default_zlib_header_is_78_9c() [io]
+    test.assert_eq_str(bytes.to_hex(zlib.emit(zlib.header())), "789c")
+
+@test
+fn test_a_dictionary_header_parses_to_six_bytes() [io]
+    let h = zlib.with_dict_id(zlib.header(), 305419896)
+    match zlib.parse(zlib.emit(h))
+        Ok((back, 6)) =>
+            match back.dict_id
+                Some(id) => test.assert(id == 305419896)
+                None     => test.fail("lost the id")
+        _             => test.fail("did not parse")
+    let wire = zlib.emit(h)
+    match zlib.parse(bytes.slice(wire, 0, 5))
+        Err(TruncatedStream(5)) => test.assert(true)
+        _                       => test.fail("expected a truncation")
+
+@test
+fn test_emit_checked_refuses_each_field_out_of_range() [io]
+    match zlib.emit_checked(zlib.with_window_bits(zlib.header(), 7))
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        _                           => test.fail("expected BadZlibHeader")
+    match zlib.emit_checked(zlib.with_level_hint(zlib.header(), 4))
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        _                           => test.fail("expected BadZlibHeader")
+    match zlib.emit_checked(zlib.with_level_hint(zlib.header(), -1))
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        _                           => test.fail("expected BadZlibHeader")
+    match zlib.emit_checked(zlib.with_window_bits(zlib.header(), 16))
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        _                           => test.fail("expected BadZlibHeader")
+
+@test
+fn test_parse_refuses_each_wrong_field() [io]
+    match zlib.parse(bytes.from_hex("7801") ?? bytes.zeros(0))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("78 01 is a valid header")
+    match zlib.parse(bytes.from_hex("7900") ?? bytes.zeros(0))
+        Err(BadZlibHeader(0, 0x79, 0)) => test.assert(true)
+        _                              => test.fail("method 9 accepted")
+    match zlib.parse(bytes.from_hex("881c") ?? bytes.zeros(0))
+        Err(BadZlibHeader(_, _, _)) => test.assert(true)
+        _                           => test.fail("window 16 accepted")
+
+@test
+fn test_a_zlib_trailer_is_read_at_an_offset() [io]
+    let wire = bytes.concat([bytes.from_str("xy"), zlib.trailer(65537)])
+    match zlib.parse_trailer(wire, 2)
+        Ok(65537) => test.assert(true)
+        _         => test.fail("trailer not read at an offset")

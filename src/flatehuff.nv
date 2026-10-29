@@ -1,0 +1,323 @@
+// flatehuff.nv — the canonical Huffman codes of RFC 1951 section 3.2.2,
+// as the decoder and the encoder both need them.
+//
+// A DEFLATE code is described by the length of each symbol's code
+// alone.  Codes of one length are consecutive integers, assigned to
+// the symbols of that length in increasing symbol order, and a shorter
+// code numerically precedes every longer one.  Two tables are enough to
+// decode from that description: how many symbols have each length, and
+// the symbols sorted by length and then by value.  A decoder reads one
+// bit at a time and, at each length, asks whether the bits so far fall
+// in the run of codes of that length.  The table costs no tree and no
+// lookup array, which is what keeps a block header cheap to set up.
+//
+// Nothing in this module is `pub`: the tables are the package's own
+// working state and not part of what a caller can depend on.
+
+// The longest code length DEFLATE allows.
+const MAX_BITS = 15
+
+// The order in which the code lengths of the code-length alphabet are
+// stored in a dynamic block header (RFC 1951 section 3.2.7).
+const CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+// What `decode` answers when the bits it was given end before a code
+// does.
+const NEED_BITS = -1
+
+// What `decode` answers when no code of any length matches.
+const NO_CODE = -2
+
+// A decoding table: `count[n]` is how many symbols have a code of
+// length `n`, and `symbol` lists the symbols by increasing length and,
+// within a length, by increasing value.
+struct Huff
+    count: [Int]
+    symbol: [Int]
+
+// The outcome of building a table.  `left` is the number of unused
+// codes at the longest length, scaled so that a complete code is 0, an
+// incomplete one is positive and an over-subscribed one is negative.
+// `culprit` is the symbol that has no code when `left` is not 0.
+struct Built
+    table: Huff
+    left: Int
+    culprit: Int
+
+// A table with no codes at all.
+fn no_codes() -> Huff
+    Huff { count: list.zeros(MAX_BITS + 1), symbol: [] }
+
+// Build a table from the code lengths of `n` symbols that start at
+// `start` in `lengths`.  A length of 0 means the symbol has no code.
+fn construct(lengths: [Int], start: Int, n: Int) -> Built
+    var count: [Int] = list.zeros(MAX_BITS + 1)
+    for s in 0..n
+        count[lengths[start + s]] += 1
+    if count[0] == n
+        return Built { table: Huff { count: count, symbol: [] }, left: 0, culprit: n }
+    var left = 1
+    for len in 1..=MAX_BITS
+        left = (left << 1) - count[len]
+        if left < 0
+            return Built { table: no_codes(), left: left,
+                           culprit: overflow_symbol(lengths, start, n) }
+    var offs: [Int] = list.zeros(MAX_BITS + 2)
+    for len in 1..=MAX_BITS
+        offs[len + 1] = offs[len] + count[len]
+    var symbol: [Int] = list.zeros(n - count[0])
+    for s in 0..n
+        let len = lengths[start + s]
+        if len != 0
+            symbol[offs[len]] = s
+            offs[len] += 1
+    var culprit = n
+    if left > 0
+        culprit = first_unused(lengths, start, n)
+    Built { table: Huff { count: count, symbol: symbol }, left: left, culprit: culprit }
+
+// The first symbol with no code in an incomplete table.
+fn first_unused(lengths: [Int], start: Int, n: Int) -> Int
+    for s in 0..n
+        if lengths[start + s] == 0
+            return s
+    n
+
+// The symbol whose code would be the first to overflow the code space
+// in an over-subscribed table, walking the symbols in canonical order.
+fn overflow_symbol(lengths: [Int], start: Int, n: Int) -> Int
+    var used = 0
+    var culprit = n
+    for len in 1..=MAX_BITS
+        for s in 0..n
+            if lengths[start + s] == len
+                used = used + (1 << (MAX_BITS - len))
+                if used > (1 << MAX_BITS) and culprit == n
+                    culprit = s
+    culprit
+
+// Whether a table may be used for decoding: a complete code, or the
+// single one-bit code that RFC 1951 section 3.2.7 allows for a block
+// that uses one distance.
+fn usable(b: Built, n: Int) -> Bool
+    if b.left == 0
+        return true
+    b.left > 0 and b.table.count[1] == n - b.table.count[0]
+
+// Decode one symbol from the low `bc` bits of `bb`, the first bit of
+// the stream being bit 0.  The answer packs the code length above bit
+// 16 and the symbol below it, or is `NEED_BITS` when the bits end
+// inside a code, or `NO_CODE` when no code matches.
+fn decode(h: Huff, bb: Int, bc: Int) -> Int
+    var code = 0
+    var first = 0
+    var index = 0
+    var len = 1
+    while len <= MAX_BITS
+        if len > bc
+            return NEED_BITS
+        code = code | ((bb >>> (len - 1)) & 1)
+        let count = h.count[len]
+        if code - count < first
+            return (len << 16) | h.symbol[index + (code - first)]
+        index = index + count
+        first = (first + count) << 1
+        code = code << 1
+        len = len + 1
+    NO_CODE
+
+// The code lengths of the fixed literal and length alphabet of RFC 1951
+// section 3.2.6: 8 bits for 0 to 143, 9 for 144 to 255, 7 for 256 to
+// 279 and 8 for 280 to 287.
+fn fixed_lit_lengths() -> [Int]
+    var out: [Int] = []
+    for s in 0..288
+        if s < 144
+            list.push(out, 8)
+        elif s < 256
+            list.push(out, 9)
+        elif s < 280
+            list.push(out, 7)
+        else
+            list.push(out, 8)
+    out
+
+// The decoding table of the fixed literal and length alphabet.
+fn fixed_lit() -> Huff
+    construct(fixed_lit_lengths(), 0, 288).table
+
+// The decoding table of the fixed distance alphabet: 32 codes of 5
+// bits, of which only 30 are ever valid.
+fn fixed_dist() -> Huff
+    var fives: [Int] = []
+    for _s in 0..32
+        list.push(fives, 5)
+    construct(fives, 0, 32).table
+
+// The first match length that length code `code` stands for, where
+// `code` is the literal and length symbol minus 257.
+fn len_base(code: Int) -> Int
+    if code < 8
+        return code + 3
+    if code == 28
+        return 258
+    let e = (code - 4) >>> 2
+    3 + ((4 + (code & 3)) << e)
+
+// How many extra bits follow length code `code`.
+fn len_extra(code: Int) -> Int
+    if code < 8 or code == 28
+        return 0
+    (code - 4) >>> 2
+
+// The first distance that distance code `code` stands for.
+fn dist_base(code: Int) -> Int
+    if code < 4
+        return code + 1
+    let e = (code - 2) >>> 1
+    1 + ((2 + (code & 1)) << e)
+
+// How many extra bits follow distance code `code`.
+fn dist_extra(code: Int) -> Int
+    if code < 4
+        return 0
+    (code - 2) >>> 1
+
+// The number of bits in the binary form of `v`, 0 for 0.
+fn bit_length(v: Int) -> Int
+    var n = 0
+    var x = v
+    while x > 0
+        x = x >>> 1
+        n = n + 1
+    n
+
+// The length code, 0 to 28, that a match length of 3 to 258 is written
+// with.  It is the inverse of `len_base` and `len_extra`.
+fn len_symbol(length: Int) -> Int
+    if length == 258
+        return 28
+    let v = length - 3
+    if v < 8
+        return v
+    let e = bit_length(v) - 3
+    4 * e + (v >>> e)
+
+// The distance code, 0 to 29, that a distance of 1 to 32768 is written
+// with.  It is the inverse of `dist_base` and `dist_extra`.
+fn dist_symbol(distance: Int) -> Int
+    let m = distance - 1
+    if m < 4
+        return m
+    let n = bit_length(m) - 1
+    2 * n + ((m >>> (n - 1)) & 1)
+
+// The low `n` bits of `v` in the opposite order.
+fn reverse_bits(v: Int, n: Int) -> Int
+    var out = 0
+    var x = v
+    for _k in 0..n
+        out = (out << 1) | (x & 1)
+        x = x >>> 1
+    out
+
+// The code of every symbol, from its code length, as the bits an encoder
+// writes: the canonical code of RFC 1951 section 3.2.2 with its bit
+// order turned round, because a Huffman code is written most
+// significant bit first into a stream that is filled least significant
+// bit first.
+fn canonical_codes(lens: [Int], n: Int) -> [Int]
+    var count: [Int] = list.zeros(MAX_BITS + 1)
+    for s in 0..n
+        count[lens[s]] += 1
+    count[0] = 0
+    var next: [Int] = list.zeros(MAX_BITS + 2)
+    var code = 0
+    for len in 1..=MAX_BITS
+        code = (code + count[len - 1]) << 1
+        next[len] = code
+    var out: [Int] = list.zeros(n)
+    for s in 0..n
+        let len = lens[s]
+        if len != 0
+            out[s] = reverse_bits(next[len], len)
+            next[len] += 1
+    out
+
+// Code lengths for the first `n` symbols with the frequencies `freq`,
+// none longer than `limit`.
+//
+// Two symbols at least always get a code, because a decoder is then
+// never asked to read a one-code table, which RFC 1951 allows and not
+// every decoder accepts.  A tree deeper than the limit is cured by
+// halving the frequencies and building again; each halving flattens the
+// tree, and a tree over equal frequencies is as shallow as a prefix code
+// can be.
+fn build_lengths(freq: [Int], n: Int, limit: Int) -> [Int]
+    var f: [Int] = list.zeros(n)
+    var used = 0
+    for s in 0..n
+        f[s] = freq[s]
+        if f[s] > 0
+            used += 1
+    var spare = 0
+    while used < 2
+        if f[spare] == 0
+            f[spare] = 1
+            used += 1
+        spare += 1
+    var lens = tree_lengths(f, n)
+    while deepest(lens, n) > limit
+        for s in 0..n
+            if f[s] > 0
+                f[s] = (f[s] + 1) >>> 1
+        lens = tree_lengths(f, n)
+    lens
+
+// The longest of the first `n` code lengths.
+fn deepest(lens: [Int], n: Int) -> Int
+    var out = 0
+    for s in 0..n
+        if lens[s] > out
+            out = lens[s]
+    out
+
+// The depth of every symbol with a nonzero frequency in the Huffman
+// tree built over them.  The tree is built by repeatedly joining the
+// two lightest nodes, which are always at the head of one of two
+// queues: the symbols in order of weight and the joined nodes in the
+// order they were made.
+fn tree_lengths(f: [Int], n: Int) -> [Int]
+    var keys: [Int] = []
+    for s in 0..n
+        if f[s] > 0
+            list.push(keys, f[s] * 512 + s)
+    list.sort(keys)
+    let m = list.len(keys)
+    var weight: [Int] = list.zeros(2 * m - 1)
+    var parent: [Int] = list.zeros(2 * m - 1)
+    for k in 0..m
+        weight[k] = keys[k] >>> 9
+    var leaf = 0
+    var node = m
+    for made in m..2 * m - 1
+        var pair: [Int] = []
+        for _k in 0..2
+            if leaf < m and (node >= made or weight[leaf] <= weight[node])
+                list.push(pair, leaf)
+                leaf += 1
+            else
+                list.push(pair, node)
+                node += 1
+        weight[made] = weight[pair[0]] + weight[pair[1]]
+        parent[pair[0]] = made
+        parent[pair[1]] = made
+    var depth: [Int] = list.zeros(2 * m - 1)
+    var k = 2 * m - 3
+    while k >= 0
+        depth[k] = depth[parent[k]] + 1
+        k -= 1
+    var out: [Int] = list.zeros(n)
+    for k in 0..m
+        out[keys[k] & 511] = depth[k]
+    out

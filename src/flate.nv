@@ -37,6 +37,8 @@
 // whole package; the levels are here because zlib's numbering is what
 // every caller and every wire format expects.
 
+use flateerror
+
 // Which container the DEFLATE bit stream is wrapped in.
 //
 // The variants are prefixed rather than spelled `Raw`, `Zlib`, `Gzip`
@@ -51,8 +53,6 @@
 // fn main() [io]
 //     println("${flate.format_name(GzipWrapped)}")     // gzip
 // ```
-use flateerror
-
 pub enum FlateFormat
     // RFC 1951 and nothing else: no header, no checksum, no length.
     // What a ZIP entry holds, what a PNG `IDAT` does NOT hold (that is
@@ -81,7 +81,10 @@ pub enum FlateFormat
 //     println("${flate.format_name(RawDeflate)}")      // raw
 // ```
 pub fn format_name(f: FlateFormat) -> Str
-    todo("flate-nv.format_name")
+    match f
+        RawDeflate  => "raw"
+        ZlibWrapped => "zlib"
+        GzipWrapped => "gzip"
 
 // How hard the encoder is asked to work: zlib's 0 through 9.
 //
@@ -116,7 +119,9 @@ pub struct FlateLevel
 //         Err(_) => println("out of range")            // this one
 // ```
 pub fn level(n: Int) -> Result<FlateLevel, FlateError>
-    todo("flate-nv.level")
+    if n < 0 or n > 9
+        return Err(BadLevel(n))
+    Ok(FlateLevel { number: n })
 
 // Level 0: every block stored, nothing compressed.
 //
@@ -132,7 +137,7 @@ pub fn level(n: Int) -> Result<FlateLevel, FlateError>
 //     println("${flate.stored().number}")              // 0
 // ```
 pub fn stored() -> FlateLevel
-    todo("flate-nv.stored")
+    FlateLevel { number: 0 }
 
 // Level 1: the fastest level that still compresses.
 //
@@ -143,7 +148,7 @@ pub fn stored() -> FlateLevel
 //     println("${flate.fastest().number}")             // 1
 // ```
 pub fn fastest() -> FlateLevel
-    todo("flate-nv.fastest")
+    FlateLevel { number: 1 }
 
 // Level 6: zlib's default, and what almost every gzip file in the
 // world was made with.
@@ -159,7 +164,7 @@ pub fn fastest() -> FlateLevel
 //     println("${flate.balanced().number}")            // 6
 // ```
 pub fn balanced() -> FlateLevel
-    todo("flate-nv.balanced")
+    FlateLevel { number: 6 }
 
 // Level 9: the smallest output this encoder knows how to make.
 //
@@ -170,7 +175,7 @@ pub fn balanced() -> FlateLevel
 //     println("${flate.smallest().number}")            // 9
 // ```
 pub fn smallest() -> FlateLevel
-    todo("flate-nv.smallest")
+    FlateLevel { number: 9 }
 
 // The level's number, for a caller writing it into a wire field.
 //
@@ -186,7 +191,7 @@ pub fn smallest() -> FlateLevel
 //     println("${flate.level_number(flate.smallest())}")   // 9
 // ```
 pub fn level_number(l: FlateLevel) -> Int
-    todo("flate-nv.level_number")
+    l.number
 
 // A hint about what the data looks like, which changes how the encoder
 // chooses blocks.
@@ -231,4 +236,9 @@ pub enum FlateStrategy
 //     println("${flate.strategy_name(FlateHuffmanOnly)}")  // huffman-only
 // ```
 pub fn strategy_name(s: FlateStrategy) -> Str
-    todo("flate-nv.strategy_name")
+    match s
+        FlateDefault     => "default"
+        FlateFiltered    => "filtered"
+        FlateHuffmanOnly => "huffman-only"
+        FlateRle         => "rle"
+        FlateFixed       => "fixed"

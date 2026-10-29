@@ -11,11 +11,6 @@ do anything else: an HTTP client honouring `Content-Encoding`, a `.gz` log
 reader, a PNG decoder — every `IDAT` chain is a zlib stream — a ZIP reader, or a
 device with 40 KiB of RAM and a firmware image to unpack.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What DEFLATE is
 
 DEFLATE compresses in two steps. First it replaces repeated stretches of the
@@ -73,9 +68,9 @@ novo pkg build
 novo test
 ```
 
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: flate-nv.<fn>`. `novo test --isolate` is the readable form,
-with one verdict per test naming the function it stopped at.
+`novo test tests` runs every suite. The decoder suite reads streams that
+CPython's `zlib` and `gzip` modules wrote at levels 0, 1, 6 and 9, and
+`tests/vectors.py` regenerates them.
 
 ## What the package contains
 
@@ -247,18 +242,55 @@ this inflates what zlib deflates.** Byte-for-byte equality with zlib's output at
 the default level is not a condition, and a test that asserted it would be
 testing this encoder's block-splitting heuristics rather than DEFLATE.
 
-## Implementation status
+## How the encoder compresses
 
-| Module | Public types | Functions | Implemented |
-| --- | --- | --- | --- |
-| `flate` | 3 | 8 | no |
-| `flatecheck` | 2 | 8 | no |
-| `flateerror` | 1 | 2 | no |
-| `inflate` | 1 | 14 | no |
-| `deflate` | 1 | 13 | no |
-| `gzip` | 1 | 12 | no |
-| `zlib` | 1 | 9 | no |
-| **Total** | **10** | **66** | **no** |
+The encoder holds input until it has a block, 65,535 bytes. It breaks the block
+into literals and back-references with a hash-chain search over the block and
+the 32 KiB before it, and at levels 4 to 9 it looks one position ahead for a
+longer match before taking the one in hand. The search effort at each level is
+zlib's. The block is then written as whichever of the three block types is
+smallest: stored, fixed codes, or codes built for that block. Code lengths are
+limited to 15 bits.
+
+The ratio is close to zlib's on text and equal on data that does not compress
+(the block is stored), and it is not identical: the same input does not give
+the same bytes. A test that compares compressed bytes with zlib's tests the
+block-splitting heuristics, which no specification fixes.
+
+`FlateHuffmanOnly` skips the search, `FlateRle` searches only for a repeat of
+the previous byte, `FlateFiltered` ignores matches shorter than six bytes, and
+`FlateFixed` never builds a table.
+
+A zlib header that promises a smaller window (`zlib.with_window_bits`) makes the
+encoder keep its matches inside that window.
+
+## Memory
+
+A decoder holds the last 32 KiB of output and the few bytes of an unfinished
+code. Each `feed` also builds its output in a buffer of its own, so the peak is
+the window plus the output one chunk produces. The encoder holds up to one
+block of input, the 32 KiB before it, and while it encodes a block, a hash head
+table of up to 32,768 integers and one integer per input byte.
+
+## Specifics worth knowing
+
+- The three block types and both containers are read and written to the
+  specification. A dynamic block header that declares more than 286 literal and
+  length codes or more than 30 distance codes is `BadHuffmanCode`.
+- A literal and length code, or a distance code, that is incomplete is
+  `IncompleteHuffmanTable`, except the single one-bit distance code that RFC
+  1951 section 3.2.7 allows. A block may also declare no distance codes at
+  all.
+- `is_corrupt` is false for `TruncatedStream` and `SourceFailed` and true for
+  every other reason.
+- The checksum and length of a stream are verified when the trailer arrives,
+  inside `feed`; the failure is recorded in the decoder and `finish` reports
+  it.
+- After the end of a stream the decoder keeps nothing: bytes that follow are
+  dropped, and `total_in` is the offset of the first of them.
+- `zlib.emit` panics for a header whose window or level hint is out of range,
+  as its documentation says; `zlib.emit_checked` is the form that answers an
+  error.
 
 ## Licence
 

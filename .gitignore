@@ -1,0 +1,5 @@
+# Build outputs.
+_novo/
+
+# Generated from the sources by `novo doc`.
+APIDOC.md

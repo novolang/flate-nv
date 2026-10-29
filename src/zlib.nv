@@ -32,6 +32,8 @@
 // from the same month.  It is not a mistake in this package and it is
 // not a mistake to fix.
 
+use flateerror
+
 // A zlib stream's header, RFC 1950 § 2.2.
 //
 // Three fields rather than two bytes, and the check digit is not among
@@ -44,8 +46,6 @@
 // fn main() [io]
 //     println("${zlib.header().window_bits}")          // 15
 // ```
-use flateerror
-
 pub struct ZlibHeader
     // The base-2 log of the window size, `8 ..= 15`.  15 is 32 KiB and
     // is what everything writes; a smaller value is a promise that no
@@ -75,7 +75,7 @@ pub struct ZlibHeader
 //     println("${bytes.len(zlib.emit(zlib.header()))}")     // 2
 // ```
 pub fn header() -> ZlibHeader
-    todo("flate-nv.zlib.header")
+    ZlibHeader { window_bits: 15, level_hint: 2, dict_id: None }
 
 // The header with a smaller window promised.
 //
@@ -95,7 +95,7 @@ pub fn header() -> ZlibHeader
 //     println("${zlib.with_window_bits(zlib.header(), 10).window_bits}")    // 10
 // ```
 pub fn with_window_bits(h: ZlibHeader, bits: Int) -> ZlibHeader
-    todo("flate-nv.zlib.with_window_bits")
+    ZlibHeader { window_bits: bits, level_hint: h.level_hint, dict_id: h.dict_id }
 
 // The header with a level hint set, `0 ..= 3`.
 //
@@ -109,7 +109,7 @@ pub fn with_window_bits(h: ZlibHeader, bits: Int) -> ZlibHeader
 //     println("${zlib.with_level_hint(zlib.header(), 3).level_hint}")   // 3
 // ```
 pub fn with_level_hint(h: ZlibHeader, hint: Int) -> ZlibHeader
-    todo("flate-nv.zlib.with_level_hint")
+    ZlibHeader { window_bits: h.window_bits, level_hint: hint, dict_id: h.dict_id }
 
 // The header with FDICT set and a dictionary identified.
 //
@@ -129,7 +129,7 @@ pub fn with_level_hint(h: ZlibHeader, hint: Int) -> ZlibHeader
 //         None    => println("none")
 // ```
 pub fn with_dict_id(h: ZlibHeader, id: Int) -> ZlibHeader
-    todo("flate-nv.zlib.with_dict_id")
+    ZlibHeader { window_bits: h.window_bits, level_hint: h.level_hint, dict_id: Some(id) }
 
 // Parse a header from the front of a buffer: the header, and how many
 // bytes it took — 2, or 6 when FDICT is set.
@@ -152,7 +152,23 @@ pub fn with_dict_id(h: ZlibHeader, id: Int) -> ZlibHeader
 //         Err(_) => println("need more bytes")          // this one
 // ```
 pub fn parse(data: Bytes) -> Result<(ZlibHeader, Int), FlateError>
-    todo("flate-nv.zlib.parse")
+    let n = bytes.len(data)
+    if n < 2
+        return Err(TruncatedStream(n))
+    let cmf = bytes.byte_at(data, 0) ?? 0
+    let flg = bytes.byte_at(data, 1) ?? 0
+    let method_ok = (cmf & 0x0F) == 8
+    let window_ok = (cmf >>> 4) <= 7
+    let check_ok = (cmf * 256 + flg) % 31 == 0
+    if not (method_ok and window_ok and check_ok)
+        return Err(BadZlibHeader(0, cmf, flg))
+    let hint = flg >>> 6
+    let window = (cmf >>> 4) + 8
+    if (flg & 0x20) == 0
+        return Ok((ZlibHeader { window_bits: window, level_hint: hint, dict_id: None }, 2))
+    match bytes.u32_be_at(data, 2)
+        Some(id) => Ok((ZlibHeader { window_bits: window, level_hint: hint, dict_id: Some(id) }, 6))
+        None     => Err(TruncatedStream(n))
 
 // The header, as the bytes that go on the wire, check digit included.
 //
@@ -172,7 +188,17 @@ pub fn parse(data: Bytes) -> Result<(ZlibHeader, Int), FlateError>
 //         Err(_) => println("window out of range")      // this one
 // ```
 pub fn emit_checked(h: ZlibHeader) -> Result<Bytes, FlateError>
-    todo("flate-nv.zlib.emit_checked")
+    let cmf = ((h.window_bits - 8) << 4) | 8
+    if h.window_bits < 8 or h.window_bits > 15 or h.level_hint < 0 or h.level_hint > 3
+        return Err(BadZlibHeader(0, cmf & 0xFF, 0))
+    var flg = h.level_hint << 6
+    if let Some(_) = h.dict_id
+        flg = flg | 0x20
+    flg = flg + (31 - (cmf * 256 + flg) % 31) % 31
+    let head = bytes.concat([bytes.u8(cmf), bytes.u8(flg)])
+    match h.dict_id
+        Some(id) => Ok(bytes.concat([head, bytes.u32_be(id)]))
+        None     => Ok(head)
 
 // The header's bytes for a header known to be in range.
 //
@@ -190,7 +216,7 @@ pub fn emit_checked(h: ZlibHeader) -> Result<Bytes, FlateError>
 //     println("${bytes.len(zlib.emit(zlib.header()))}")     // 2
 // ```
 pub fn emit(h: ZlibHeader) -> Bytes
-    todo("flate-nv.zlib.emit")
+    emit_checked(h)!
 
 // A zlib trailer: the Adler-32 of the plaintext, four BIG-endian
 // bytes.
@@ -206,7 +232,7 @@ pub fn emit(h: ZlibHeader) -> Bytes
 //     println("${bytes.len(zlib.trailer(1))}")             // 4
 // ```
 pub fn trailer(adler: Int) -> Bytes
-    todo("flate-nv.zlib.trailer")
+    bytes.u32_be(adler)
 
 // Parse a trailer at an offset: the Adler-32 it claims.
 //
@@ -219,4 +245,6 @@ pub fn trailer(adler: Int) -> Bytes
 //         Err(_) => println("truncated")                // this one
 // ```
 pub fn parse_trailer(data: Bytes, offset: Int) -> Result<Int, FlateError>
-    todo("flate-nv.zlib.parse_trailer")
+    match bytes.u32_be_at(data, offset)
+        Some(v) => Ok(v)
+        None    => Err(TruncatedStream(bytes.len(data)))

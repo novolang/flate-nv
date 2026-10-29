@@ -1,15 +1,13 @@
 [package]
 name        = "flate-nv"
-version     = "0.0.4"
+version     = "0.1.0"
 description = "DEFLATE with the gzip and zlib wrappers, decoded and encoded without performing anything: a feed-and-drain decoder the host pumps, an encoder that returns bytes, the two container headers as typed values, CRC32 and Adler-32 as the checks each container demands, compression levels as a value rather than a magic integer, and errors that name the byte offset in the compressed stream."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# Experimental: the decoder is checked against streams zlib wrote at
+# levels 0, 1, 6 and 9 and the encoder against zlib reading what it
+# wrote, but no program outside this repository has used the package yet.
+stability   = "experimental"
 
 # `core`, and the one function that takes a stream stays inside that
 # budget by BINDING its cost rather than spending one:
@@ -25,7 +23,7 @@ category    = "compression"
 tags        = ["deflate", "gzip", "zlib", "compression", "rfc1951", "rfc1952", "crc32", "sans-io"]
 repository  = "https://github.com/novolang/flate-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.21.1"
+novo        = ">= 0.22.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -35,7 +33,6 @@ novo        = ">= 0.21.1"
 
 [dependencies]
 # None.  The bit reader, the Huffman decoder and both checksums are
-# hand-written passes over bytes the caller already holds.  The plan's
-# `bitstream-nv` row is the shared bit-level reader these codecs were
-# expected to take; it is not on the grid yet, and this package's
-# report says what taking it would change.
+# hand-written passes over bytes the caller already holds, and a general
+# bit-stream package would cost a call per code on the decoder's hot
+# path.

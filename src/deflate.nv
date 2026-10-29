@@ -44,13 +44,25 @@
 // encoder's business, and zlib's answers are not the specification
 // even though zlib's output is what every test corpus contains.  The
 // README says what this means for testing: byte-for-byte equality with
-// zlib is an aspiration for the default level and NOT a correctness
-// condition, and the correctness condition is that zlib can inflate
+// zlib is not a correctness condition, and the correctness condition is that zlib can inflate
 // what this deflates and vice versa.
+//
+// HOW THE ENCODER WORKS
+//
+// Input is held until a block's worth, 65,535 bytes, has arrived.  Each
+// block is broken into literals and back-references by a hash-chain
+// search over the block and the 32 KiB before it, with the lazy
+// matching zlib's levels 4 to 9 use, and is then written as whichever
+// of three block types is smallest by count: stored, fixed codes, or
+// codes built for that block.  Code lengths are limited to 15 bits by
+// flattening the frequencies until the tree is shallow enough.  The
+// search effort per level is zlib's table.
 
 use flate
 use gzip
 use zlib
+use flatecheck
+use flatehuff
 
 // An encoder between chunks.
 //
@@ -76,16 +88,19 @@ pub struct Deflater
     // The block-choice hint in force; `FlateDefault` unless
     // `with_strategy` said otherwise.
     strategy: FlateStrategy
-    // Where the machine is: before the header, mid-block, or done.
+    // Where the machine is: before the header, open, or done.
     state: Int
     // Uncompressed bytes accepted so far, across every `push`.
     consumed: Int
     // Compressed bytes emitted so far, across every call.
     produced: Int
-    // Input held back for the match search: at most a window plus a
-    // block's worth, never more, which is what bounds an encoder's
-    // memory to something a device can afford.
+    // Input held back until a block's worth has arrived: less than one
+    // block, except while a single large `push` is being encoded.
     pending: Bytes
+    // The last 32 KiB of input that has already been encoded, which a
+    // match in the next block may point into.  With `pending` it is
+    // what bounds the encoder's memory.
+    window: Bytes
     // Bits emitted into the current output byte but not yet flushed,
     // and how many — DEFLATE is a bit stream, so a block boundary
     // almost never lands on a byte boundary.
@@ -119,7 +134,20 @@ pub struct Deflater
 //     println("${flate.level_number(deflate.level_of(e))}")    // 6
 // ```
 pub fn deflater(fmt: FlateFormat, l: FlateLevel) -> Deflater
-    todo("flate-nv.deflater")
+    var gz: ?GzipHeader = None
+    var zl: ?ZlibHeader = None
+    match fmt
+        GzipWrapped =>
+            gz = Some(default_gzip_header(l))
+        ZlibWrapped =>
+            zl = Some(zlib.with_level_hint(zlib.header(), level_hint(l)))
+        RawDeflate  =>
+            gz = None
+    Deflater { format: fmt, level: l, strategy: FlateDefault,
+               state: STATE_START, consumed: 0, produced: 0,
+               pending: bytes.zeros(0), window: bytes.zeros(0), bit_buf: 0,
+               bit_count: 0, check: initial_check(fmt), gzip_head: gz,
+               zlib_head: zl }
 
 // The level this encoder was built with.
 //
@@ -132,7 +160,7 @@ pub fn deflater(fmt: FlateFormat, l: FlateLevel) -> Deflater
 //     println("${flate.level_number(deflate.level_of(e))}")    // 9
 // ```
 pub fn level_of(e: Deflater) -> FlateLevel
-    todo("flate-nv.level_of")
+    e.level
 
 // Choose how blocks are formed.
 //
@@ -152,7 +180,11 @@ pub fn level_of(e: Deflater) -> FlateLevel
 //     println("${flate.strategy_name(deflate.strategy_of(e))}")    // rle
 // ```
 pub fn with_strategy(e: Deflater, s: FlateStrategy) -> Deflater
-    todo("flate-nv.with_strategy")
+    Deflater { format: e.format, level: e.level, strategy: s,
+                 state: e.state, consumed: e.consumed, produced: e.produced,
+                 pending: e.pending, window: e.window, bit_buf: e.bit_buf,
+                 bit_count: e.bit_count, check: e.check,
+                 gzip_head: e.gzip_head, zlib_head: e.zlib_head }
 
 // The strategy in force.
 //
@@ -165,7 +197,7 @@ pub fn with_strategy(e: Deflater, s: FlateStrategy) -> Deflater
 //     println("${flate.strategy_name(deflate.strategy_of(e))}")    // default
 // ```
 pub fn strategy_of(e: Deflater) -> FlateStrategy
-    todo("flate-nv.strategy_of")
+    e.strategy
 
 // Replace the gzip header this encoder will emit.
 //
@@ -187,7 +219,16 @@ pub fn strategy_of(e: Deflater) -> FlateStrategy
 //     println("${deflate.total_out(e)}")                   // 0
 // ```
 pub fn with_gzip_header(e: Deflater, h: GzipHeader) -> Deflater
-    todo("flate-nv.with_gzip_header")
+    if e.state != STATE_START
+        return e
+    match e.format
+        GzipWrapped =>
+            Deflater { format: e.format, level: e.level, strategy: e.strategy,
+                         state: e.state, consumed: e.consumed, produced: e.produced,
+                         pending: e.pending, window: e.window, bit_buf: e.bit_buf,
+                         bit_count: e.bit_count, check: e.check, gzip_head: Some(h),
+                         zlib_head: e.zlib_head }
+        _           => e
 
 // Replace the zlib header this encoder will emit.
 //
@@ -206,7 +247,16 @@ pub fn with_gzip_header(e: Deflater, h: GzipHeader) -> Deflater
 //     println("${deflate.total_out(e)}")                   // 0
 // ```
 pub fn with_zlib_header(e: Deflater, h: ZlibHeader) -> Deflater
-    todo("flate-nv.with_zlib_header")
+    if e.state != STATE_START
+        return e
+    match e.format
+        ZlibWrapped =>
+            Deflater { format: e.format, level: e.level, strategy: e.strategy,
+                         state: e.state, consumed: e.consumed, produced: e.produced,
+                         pending: e.pending, window: e.window, bit_buf: e.bit_buf,
+                         bit_count: e.bit_count, check: e.check,
+                         gzip_head: e.gzip_head, zlib_head: Some(h) }
+        _           => e
 
 // Give the encoder more input; get back the encoder to give the next
 // chunk to, and whatever bytes were ready.
@@ -230,7 +280,7 @@ pub fn with_zlib_header(e: Deflater, h: ZlibHeader) -> Deflater
 //     println("${bytes.len(out)}")                         // very likely 0
 // ```
 pub fn push(e: Deflater, chunk: Bytes) -> (Deflater, Bytes)
-    todo("flate-nv.push")
+    run(e, chunk, MODE_PUSH)
 
 // Emit everything the encoder is holding, ending the current block.
 //
@@ -255,7 +305,7 @@ pub fn push(e: Deflater, chunk: Bytes) -> (Deflater, Bytes)
 //     println("${bytes.len(out) > 0}")                     // true
 // ```
 pub fn flush(e: Deflater) -> (Deflater, Bytes)
-    todo("flate-nv.flush")
+    run(e, bytes.zeros(0), MODE_FLUSH)
 
 // End the stream: the last block with BFINAL set, and the container's
 // trailer.
@@ -275,7 +325,7 @@ pub fn flush(e: Deflater) -> (Deflater, Bytes)
 //     println("${deflate.is_done(e2)}")                    // true
 // ```
 pub fn finish(e: Deflater) -> (Deflater, Bytes)
-    todo("flate-nv.finish")
+    run(e, bytes.zeros(0), MODE_FINISH)
 
 // Whether `finish` has been called.
 //
@@ -287,7 +337,7 @@ pub fn finish(e: Deflater) -> (Deflater, Bytes)
 //     println("${deflate.is_done(deflate.deflater(RawDeflate, flate.fastest()))}")   // false
 // ```
 pub fn is_done(e: Deflater) -> Bool
-    todo("flate-nv.is_done")
+    e.state == STATE_DONE
 
 // Uncompressed bytes accepted so far, across every `push`.
 //
@@ -299,7 +349,7 @@ pub fn is_done(e: Deflater) -> Bool
 //     println("${deflate.total_in(deflate.deflater(RawDeflate, flate.fastest()))}")  // 0
 // ```
 pub fn total_in(e: Deflater) -> Int
-    todo("flate-nv.total_in")
+    e.consumed
 
 // Compressed bytes emitted so far, header and trailer included.
 //
@@ -314,7 +364,7 @@ pub fn total_in(e: Deflater) -> Int
 //     println("${deflate.total_out(deflate.deflater(RawDeflate, flate.fastest()))}") // 0
 // ```
 pub fn total_out(e: Deflater) -> Int
-    todo("flate-nv.total_out")
+    e.produced
 
 // Compress a whole buffer, header and trailer and all.
 //
@@ -331,4 +381,604 @@ pub fn total_out(e: Deflater) -> Int
 //     println("${bytes.len(out) > 0}")                     // true
 // ```
 pub fn compress(data: Bytes, fmt: FlateFormat, l: FlateLevel) -> Bytes
-    todo("flate-nv.compress")
+    let (e, body) = push(deflater(fmt, l), data)
+    let (_done, tail) = finish(e)
+    bytes.concat([body, tail])
+
+// The states of the encoder.
+const STATE_START = 0
+const STATE_OPEN = 1
+const STATE_DONE = 2
+
+// What a call to `run` was asked to do.
+const MODE_PUSH = 0
+const MODE_FLUSH = 1
+const MODE_FINISH = 2
+
+// How much input makes one block.  It is also the most a stored block
+// can hold, so a block that is better stored is one stored block.
+const BLOCK = 65535
+
+// How far back a match may reach, and so how much input is kept.
+const WINDOW_SIZE = 32768
+
+// The longest match DEFLATE can write, and the shortest.
+const MAX_MATCH = 258
+const MIN_MATCH = 3
+
+// A match of the shortest length is not worth its distance when it
+// reaches further than this.
+const TOO_FAR = 4096
+
+// The search strategies, as `Params.mode` holds them.
+const MODE_SEARCH = 0
+const MODE_LITERALS = 1
+const MODE_RUNS = 2
+const MODE_FILTERED = 3
+
+// The value a running check has before any byte has gone into it.
+fn initial_check(fmt: FlateFormat) -> Int
+    match fmt
+        ZlibWrapped => 1
+        _           => 0
+
+// The two-bit FLEVEL a zlib header carries for a compression level.
+fn level_hint(l: FlateLevel) -> Int
+    if l.number < 2
+        return 0
+    if l.number < 6
+        return 1
+    if l.number == 6
+        return 2
+    3
+
+// The gzip header an encoder starts with: the defaults of
+// `gzip.header` and the XFL byte that names the level.
+fn default_gzip_header(l: FlateLevel) -> GzipHeader
+    var xfl = 0
+    if l.number == 9
+        xfl = 2
+    if l.number == 1
+        xfl = 4
+    let h = gzip.header()
+    GzipHeader { mtime: h.mtime, xfl: xfl, os: h.os, name: h.name,
+                 comment: h.comment, extra: h.extra, is_text: h.is_text,
+                 has_header_crc: h.has_header_crc }
+
+// How hard the match search works, from the level and the strategy.
+//
+// `chain` is how many earlier positions with the same hash are
+// compared, `nice` is a match length that ends the search, `good` is a
+// match length after which the search is shortened to a quarter, and
+// `lazy` is the match length from which it is not worth looking one
+// position further for a longer one (0 for never looking).  The values
+// are the ones zlib uses for each level; they decide the ratio and the
+// time and nothing about the validity of the stream.
+struct Params
+    chain: Int
+    nice: Int
+    good: Int
+    lazy: Int
+    maxdist: Int
+    mode: Int
+    stored: Bool
+    fixed: Bool
+
+fn params_of(e: Deflater) -> Params
+    let n = e.level.number
+    var chain = 4
+    var nice = 8
+    var good = 4
+    var lazy = 0
+    if n == 2
+        chain = 8
+        nice = 16
+    if n == 3
+        chain = 32
+        nice = 32
+    if n == 4
+        chain = 16
+        nice = 16
+        lazy = 4
+    if n == 5
+        chain = 32
+        nice = 32
+        good = 8
+        lazy = 16
+    if n == 6
+        chain = 128
+        nice = 128
+        good = 8
+        lazy = 16
+    if n == 7
+        chain = 256
+        nice = 128
+        good = 8
+        lazy = 32
+    if n == 8
+        chain = 1024
+        nice = 258
+        good = 32
+        lazy = 128
+    if n == 9
+        chain = 4096
+        nice = 258
+        good = 32
+        lazy = 258
+    var mode = MODE_SEARCH
+    match e.strategy
+        FlateHuffmanOnly =>
+            mode = MODE_LITERALS
+        FlateRle         =>
+            mode = MODE_RUNS
+        FlateFiltered    =>
+            mode = MODE_FILTERED
+        _                =>
+            mode = MODE_SEARCH
+    var maxdist = WINDOW_SIZE
+    if let Some(h) = e.zlib_head
+        maxdist = min_int(WINDOW_SIZE, 1 << h.window_bits)
+    var fixed = false
+    match e.strategy
+        FlateFixed =>
+            fixed = true
+        _          =>
+            fixed = false
+    Params { chain: chain, nice: nice, good: good, lazy: lazy,
+             maxdist: maxdist, mode: mode, stored: n == 0, fixed: fixed }
+
+// The smaller of two integers.
+fn min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// The larger of two integers.
+fn max_int(a: Int, b: Int) -> Int
+    if a > b
+        return a
+    b
+
+// The output being built, and the bits of a partly filled byte.
+struct Out
+    var buf: Bytes
+    var len: Int
+    var bb: Int
+    var bc: Int
+
+fn open_out(e: Deflater) -> Out
+    Out { buf: bytes.zeros(1024), len: 0, bb: e.bit_buf, bc: e.bit_count }
+
+// Append one whole byte.
+fn put_byte(var o: Out, b: Int)
+    if o.len >= bytes.len(o.buf)
+        var bigger = bytes.zeros(2 * bytes.len(o.buf))
+        bytes.copy_into(bigger, 0, o.buf, 0, o.len)
+        o.buf = bigger
+    bytes.set_u8(o.buf, o.len, b)
+    o.len = o.len + 1
+
+// Append the low `n` bits of `v`, least significant first.  `n` is at
+// most 24.
+fn put(var o: Out, v: Int, n: Int)
+    o.bb = o.bb | (v << o.bc)
+    o.bc = o.bc + n
+    while o.bc >= 8
+        put_byte(var o, o.bb & 0xFF)
+        o.bb = o.bb >>> 8
+        o.bc = o.bc - 8
+
+// Append bits to the next byte boundary.
+fn pad(var o: Out)
+    if o.bc > 0
+        put(var o, 0, 8 - o.bc)
+
+// Append whole bytes at a byte boundary.
+fn put_bytes(var o: Out, src: Bytes)
+    let n = bytes.len(src)
+    if o.len + n > bytes.len(o.buf)
+        var bigger = bytes.zeros(max_int(2 * bytes.len(o.buf), o.len + n))
+        bytes.copy_into(bigger, 0, o.buf, 0, o.len)
+        o.buf = bigger
+    bytes.copy_into(o.buf, o.len, src, 0, n)
+    o.len = o.len + n
+
+// The container's header.
+fn put_header(var o: Out, e: Deflater)
+    if let Some(h) = e.gzip_head
+        put_bytes(var o, gzip.emit(h))
+    if let Some(h) = e.zlib_head
+        put_bytes(var o, zlib.emit(h))
+
+// The container's trailer.
+fn put_trailer(var o: Out, e: Deflater, check: Int, total: Int)
+    match e.format
+        GzipWrapped => put_bytes(var o, gzip.trailer(check, total & 0xFFFFFFFF))
+        ZlibWrapped => put_bytes(var o, zlib.trailer(check))
+        RawDeflate  => pad(var o)
+
+// The check after `chunk` has been folded into the running one.
+fn updated_check(e: Deflater, chunk: Bytes) -> Int
+    match e.format
+        GzipWrapped =>
+            let crc = Crc32 { running: e.check ^ 0xFFFFFFFF }
+            flatecheck.crc32_value(flatecheck.crc32_update(crc, chunk))
+        ZlibWrapped =>
+            let sums = Adler32 { lo: e.check & 0xFFFF, hi: e.check >>> 16 }
+            flatecheck.adler32_value(flatecheck.adler32_update(sums, chunk))
+        RawDeflate  => 0
+
+// The work of `push`, `flush` and `finish`: header if none has gone
+// out, every whole block the input makes, and then whatever the mode
+// calls for.
+fn run(e: Deflater, chunk: Bytes, mode: Int) -> (Deflater, Bytes)
+    if e.state == STATE_DONE
+        return (e, bytes.zeros(0))
+    if mode == MODE_PUSH and bytes.len(chunk) == 0
+        return (e, bytes.zeros(0))
+    var o = open_out(e)
+    if e.state == STATE_START
+        put_header(var o, e)
+    let check = updated_check(e, chunk)
+    let params = params_of(e)
+    let input = bytes.concat([e.pending, chunk])
+    let total = bytes.len(input)
+    var window = bytes.clone(e.window)
+    var at = 0
+    while total - at > BLOCK or mode == MODE_PUSH and total - at == BLOCK
+        window = encode_piece(var o, window, bytes.slice(input, at, at + BLOCK), false, params)
+        at = at + BLOCK
+    var pending = bytes.zeros(0)
+    var state = STATE_OPEN
+    let consumed = e.consumed + bytes.len(chunk)
+    if mode == MODE_PUSH
+        pending = bytes.slice(input, at, total)
+    if mode == MODE_FLUSH
+        if total > at
+            window = encode_piece(var o, window, bytes.slice(input, at, total), false, params)
+        put(var o, 0, 3)
+        pad(var o)
+        put_bytes(var o, bytes.concat([bytes.u16_le(0), bytes.u16_le(0xFFFF)]))
+    if mode == MODE_FINISH
+        window = encode_piece(var o, window, bytes.slice(input, at, total), true, params)
+        pad(var o)
+        put_trailer(var o, e, check, consumed)
+        state = STATE_DONE
+    let out = bytes.slice(o.buf, 0, o.len)
+    let next = Deflater { format: e.format, level: e.level,
+                          strategy: e.strategy, state: state,
+                          consumed: consumed,
+                          produced: e.produced + o.len, pending: pending,
+                          window: window, bit_buf: o.bb, bit_count: o.bc,
+                          check: check, gzip_head: e.gzip_head,
+                          zlib_head: e.zlib_head }
+    (next, out)
+
+// Encode one block's worth of input, and answer the window the next
+// block starts from.
+fn encode_piece(var o: Out, window: Bytes, piece: Bytes, final: Bool, p: Params) -> Bytes
+    let n = bytes.len(piece)
+    if p.stored
+        put_stored(var o, piece, 0, n, final)
+        return bytes.zeros(0)
+    let data = bytes.concat([window, piece])
+    let from = bytes.len(window)
+    let to = bytes.len(data)
+    var t = Toks { items: [], lf: list.zeros(286), df: list.zeros(30) }
+    search(var t, data, from, to, p)
+    write_block(var o, var t, data, from, to, final, p.fixed)
+    bytes.slice(data, max_int(0, to - WINDOW_SIZE), to)
+
+// A stored block holding `data[from..to)`, at most 65535 bytes.
+fn put_stored(var o: Out, data: Bytes, from: Int, to: Int, final: Bool)
+    var bit = 0
+    if final
+        bit = 1
+    put(var o, bit, 1)
+    put(var o, 0, 2)
+    pad(var o)
+    let n = to - from
+    put_bytes(var o, bytes.concat([bytes.u16_le(n), bytes.u16_le(n ^ 0xFFFF)]))
+    put_bytes(var o, bytes.slice(data, from, to))
+
+// The tokens of a block and how often each symbol occurs in them.  A
+// literal token is its byte, a match is `(distance << 9) | length`.
+struct Toks
+    var items: [Int]
+    var lf: [Int]
+    var df: [Int]
+
+fn push_literal(var t: Toks, b: Int)
+    list.push(t.items, b)
+    t.lf[b] += 1
+
+fn push_match(var t: Toks, length: Int, dist: Int)
+    list.push(t.items, (dist << 9) | length)
+    t.lf[257 + flatehuff.len_symbol(length)] += 1
+    t.df[flatehuff.dist_symbol(dist)] += 1
+
+// The hash chains over `data`: `head[h]` is one more than the latest
+// position whose three bytes hash to `h`, and `prev[p]` is the same for
+// the position before `p` in that chain.  Positions below `ins` are in
+// the chains.
+struct Chains
+    var head: [Int]
+    var prev: [Int]
+    var ins: Int
+    bits: Int
+
+fn open_chains(n: Int) -> Chains
+    var width = 9
+    while width < 15 and (1 << width) < n
+        width = width + 1
+    Chains { head: list.zeros(1 << width), prev: list.zeros(n), ins: 0, bits: width }
+
+fn byte_of(data: Bytes, i: Int) -> Int
+    bytes.byte_at(data, i) ?? 0
+
+fn hash3(data: Bytes, i: Int, bits: Int) -> Int
+    let v = (byte_of(data, i) << 16) | (byte_of(data, i + 1) << 8) | byte_of(data, i + 2)
+    ((v * 2654435761) >>> (32 - bits)) & ((1 << bits) - 1)
+
+// Put every position below `upto` into the chains, those within two
+// bytes of `to` excepted because they have no three bytes to hash.
+fn catch_up(var ch: Chains, data: Bytes, upto: Int, to: Int)
+    for p in ch.ins..upto
+        if p + MIN_MATCH <= to
+            let h = hash3(data, p, ch.bits)
+            ch.prev[p] = ch.head[h]
+            ch.head[h] = p + 1
+    ch.ins = upto
+
+// How many bytes from `a` and `b` agree, at most `limit`.
+fn common(data: Bytes, a: Int, b: Int, limit: Int) -> Int
+    var n = 0
+    while n < limit and byte_of(data, a + n) == byte_of(data, b + n)
+        n = n + 1
+    n
+
+// The longest match for position `i` that is longer than `beat`, as its
+// length and distance, or length 0 when there is none.
+fn find(var ch: Chains, data: Bytes, i: Int, to: Int, p: Params, beat: Int) -> (Int, Int)
+    if i + MIN_MATCH > to
+        return (0, 0)
+    catch_up(var ch, data, i, to)
+    var cand = ch.head[hash3(data, i, ch.bits)] - 1
+    var best = beat
+    var best_dist = 0
+    let limit = min_int(MAX_MATCH, to - i)
+    var chain = p.chain
+    if beat >= p.good
+        chain = chain >>> 2
+    while cand >= 0 and chain > 0 and i - cand <= p.maxdist and best < limit
+        if byte_of(data, cand + best) == byte_of(data, i + best)
+            let l = common(data, cand, i, limit)
+            if l > best
+                best = l
+                best_dist = i - cand
+                if l >= p.nice
+                    break
+        cand = ch.prev[cand] - 1
+        chain = chain - 1
+    if best_dist == 0
+        return (0, 0)
+    if best == MIN_MATCH and best_dist > TOO_FAR
+        return (0, 0)
+    if p.mode == MODE_FILTERED and best < 6
+        return (0, 0)
+    (best, best_dist)
+
+// The run of the byte before position `i`, as a match of distance 1.
+fn find_run(data: Bytes, i: Int, to: Int) -> (Int, Int)
+    if i == 0 or i + MIN_MATCH > to
+        return (0, 0)
+    let l = common(data, i - 1, i, min_int(MAX_MATCH, to - i))
+    if l < MIN_MATCH
+        return (0, 0)
+    (l, 1)
+
+// Break `data[from..to)` into literals and matches.
+//
+// Matches are found through the hash chains.  When a match is found
+// and is short of `lazy`, the match at the next position is looked for
+// too, and if it is longer the byte here is a literal instead.
+fn search(var t: Toks, data: Bytes, from: Int, to: Int, p: Params)
+    var ch = open_chains(to)
+    var i = from
+    var pre_at = -1
+    var pre_len = 0
+    var pre_dist = 0
+    while i < to
+        var length = 0
+        var dist = 0
+        if p.mode == MODE_LITERALS
+            length = 0
+        elif p.mode == MODE_RUNS
+            let (l, d) = find_run(data, i, to)
+            length = l
+            dist = d
+        elif pre_at == i
+            length = pre_len
+            dist = pre_dist
+        else
+            let (l, d) = find(var ch, data, i, to, p, MIN_MATCH - 1)
+            length = l
+            dist = d
+        if length >= MIN_MATCH and p.lazy > 0 and length < p.lazy and i + 1 < to and p.mode != MODE_RUNS
+            catch_up(var ch, data, i + 1, to)
+            let (l2, d2) = find(var ch, data, i + 1, to, p, length)
+            if l2 > length
+                push_literal(var t, byte_of(data, i))
+                pre_at = i + 1
+                pre_len = l2
+                pre_dist = d2
+                i = i + 1
+                continue
+        if length >= MIN_MATCH
+            push_match(var t, length, dist)
+            i = i + length
+        else
+            push_literal(var t, byte_of(data, i))
+            i = i + 1
+
+// The bits the symbols of a block take in a given pair of codes, extra
+// bits included.
+fn body_bits(t: Toks, lit_lens: [Int], dist_lens: [Int]) -> Int
+    var total = 0
+    for s in 0..286
+        total = total + t.lf[s] * lit_lens[s]
+        if s >= 257
+            total = total + t.lf[s] * flatehuff.len_extra(s - 257)
+    for d in 0..30
+        total = total + t.df[d] * (dist_lens[d] + flatehuff.dist_extra(d))
+    total
+
+// The code lengths of a dynamic block's header as the run-length symbols
+// of RFC 1951 section 3.2.7 write them.  Each entry is a symbol of the
+// code-length alphabet in its low byte and the value of its extra bits
+// above it.
+fn run_lengths(lens: [Int], n: Int) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    loop
+        if i >= n
+            break
+        let v = lens[i]
+        var run = 1
+        while i + run < n and lens[i + run] == v
+            run = run + 1
+        i = i + run
+        if v == 0
+            while run >= 11
+                let r = min_int(run, 138)
+                list.push(out, 18 | ((r - 11) << 8))
+                run = run - r
+            if run >= 3
+                list.push(out, 17 | ((run - 3) << 8))
+                run = 0
+            while run > 0
+                list.push(out, 0)
+                run = run - 1
+        else
+            list.push(out, v)
+            run = run - 1
+            while run >= 3
+                let r = min_int(run, 6)
+                list.push(out, 16 | ((r - 3) << 8))
+                run = run - r
+            while run > 0
+                list.push(out, v)
+                run = run - 1
+    out
+
+// How many extra bits a symbol of the code-length alphabet carries.
+fn clen_extra(sym: Int) -> Int
+    if sym == 16
+        return 2
+    if sym == 17
+        return 3
+    if sym == 18
+        return 7
+    0
+
+// The length of the used part of a list of code lengths, never below
+// `least`.
+fn used_length(lens: [Int], n: Int, least: Int) -> Int
+    var k = n
+    while k > least and lens[k - 1] == 0
+        k = k - 1
+    k
+
+// A dynamic block's code and what it costs.
+struct Dynamic
+    lit_lens: [Int]
+    dist_lens: [Int]
+    nlit: Int
+    ndist: Int
+    runs: [Int]
+    clen_lens: [Int]
+    hclen: Int
+    bits: Int
+
+fn plan_dynamic(t: Toks) -> Dynamic
+    let lit_lens = flatehuff.build_lengths(t.lf, 286, 15)
+    let dist_lens = flatehuff.build_lengths(t.df, 30, 15)
+    let nlit = used_length(lit_lens, 286, 257)
+    let ndist = used_length(dist_lens, 30, 1)
+    var runs = run_lengths(lit_lens, nlit)
+    list.append(runs, run_lengths(dist_lens, ndist))
+    var cf: [Int] = list.zeros(19)
+    for r in runs
+        cf[r & 0xFF] += 1
+    let clen_lens = flatehuff.build_lengths(cf, 19, 7)
+    var hclen = 19
+    while hclen > 4 and clen_lens[flatehuff.CLEN_ORDER[hclen - 1]] == 0
+        hclen = hclen - 1
+    var cost = 3 + 14 + 3 * hclen + body_bits(t, lit_lens, dist_lens)
+    for r in runs
+        cost = cost + clen_lens[r & 0xFF] + clen_extra(r & 0xFF)
+    Dynamic { lit_lens: lit_lens, dist_lens: dist_lens, nlit: nlit,
+              ndist: ndist, runs: runs, clen_lens: clen_lens, hclen: hclen,
+              bits: cost }
+
+// Write a block of tokens in whichever of the three block types is
+// smallest: stored, the fixed codes, or codes built for these tokens.
+fn write_block(var o: Out, var t: Toks, data: Bytes, from: Int, to: Int, final: Bool,
+               fixed_only: Bool)
+    t.lf[256] = 1
+    let fixed_lit = flatehuff.fixed_lit_lengths()
+    var fixed_dist: [Int] = []
+    for _d in 0..30
+        list.push(fixed_dist, 5)
+    let fixed_bits = 3 + body_bits(t, fixed_lit, fixed_dist) + fixed_lit[256]
+    let plan = plan_dynamic(t)
+    var dynamic_bits = plan.bits + plan.lit_lens[256]
+    if fixed_only
+        dynamic_bits = fixed_bits + 1
+    let stored_bits = 8 * (to - from) + 40
+    var bit = 0
+    if final
+        bit = 1
+    if to > from and stored_bits < fixed_bits and stored_bits < dynamic_bits
+        put_stored(var o, data, from, to, final)
+        return
+    if fixed_bits <= dynamic_bits
+        put(var o, bit | (1 << 1), 3)
+        emit_tokens(var o, t.items, flatehuff.canonical_codes(fixed_lit, 288), fixed_lit,
+                    flatehuff.canonical_codes(fixed_dist, 30), fixed_dist)
+        return
+    put(var o, bit | (2 << 1), 3)
+    put(var o, plan.nlit - 257, 5)
+    put(var o, plan.ndist - 1, 5)
+    put(var o, plan.hclen - 4, 4)
+    for i in 0..plan.hclen
+        put(var o, plan.clen_lens[flatehuff.CLEN_ORDER[i]], 3)
+    let clen_codes = flatehuff.canonical_codes(plan.clen_lens, 19)
+    for r in plan.runs
+        let sym = r & 0xFF
+        put(var o, clen_codes[sym], plan.clen_lens[sym])
+        if clen_extra(sym) > 0
+            put(var o, r >>> 8, clen_extra(sym))
+    emit_tokens(var o, t.items, flatehuff.canonical_codes(plan.lit_lens, 286), plan.lit_lens,
+                flatehuff.canonical_codes(plan.dist_lens, 30), plan.dist_lens)
+
+// The tokens of a block and its end-of-block symbol, in the given codes.
+fn emit_tokens(var o: Out, items: [Int], lit_codes: [Int], lit_lens: [Int], dist_codes: [Int],
+               dist_lens: [Int])
+    for tok in items
+        if tok < 256
+            put(var o, lit_codes[tok], lit_lens[tok])
+        else
+            let length = tok & 511
+            let dist = tok >>> 9
+            let ls = flatehuff.len_symbol(length)
+            put(var o, lit_codes[257 + ls], lit_lens[257 + ls])
+            let lx = flatehuff.len_extra(ls)
+            if lx > 0
+                put(var o, length - flatehuff.len_base(ls), lx)
+            let ds = flatehuff.dist_symbol(dist)
+            put(var o, dist_codes[ds], dist_lens[ds])
+            let dx = flatehuff.dist_extra(ds)
+            if dx > 0
+                put(var o, dist - flatehuff.dist_base(ds), dx)
+    put(var o, lit_codes[256], lit_lens[256])

@@ -29,14 +29,13 @@
 // needs most.
 //
 // `SourceFailed` IS THE LAYER SEAM, and it is not called `Transport`.
-// csv-nv's `CsvError` already declares a `Transport` variant, and
-// variant constructors resolve by NAME rather than by the type the
-// expression is required to have (probed 2026-09-09: `Err(Transport(x))`
-// in a function returning `Result<_, BErr>` binds `AErr`'s constructor
-// and fails E2001).  A second `Transport` in the registry would
-// therefore break the first program that used both packages.  The
-// README's naming section records that; here it is just the reason for
-// the longer name.
+// csv-nv's `CsvError` already declares a `Transport` variant, and a
+// variant constructor resolves by NAME rather than by the type the
+// expression is required to have, so `Err(Transport(x))` in a function
+// returning another package's error type binds the wrong constructor.
+// A second `Transport` would break the first program that used both
+// packages.  The README's naming section records that; here it is just
+// the reason for the longer name.
 
 // Why a compressed stream, or a request about one, could not be
 // answered.
@@ -147,13 +146,16 @@ pub enum FlateError
 // variant instead.
 //
 // `Result<T, FlateError>` requires this impl — SPEC § 3.4 makes
-// `Error` the bound on a result's error type — so it exists whether or
-// not an interface release has anything to say yet, and its body is a
-// `todo()` like every other body here.
+// `Error` the bound on a result's error type.
 impl Error for FlateError
-    // Panics with `not implemented` until the bodies land.
+    // The one-line report.  An error about a place in the stream
+    // reads `at byte <offset>: <reason>`; `BadLevel` and
+    // `SourceFailed` have no place and read as the reason alone.
     fn message(self) -> Str
-        todo("flate-nv.FlateError.message")
+        let at = offset_of(self)
+        if at < 0
+            return reason_of(self)
+        "at byte ${at}: ${reason_of(self)}"
 
 // The 0-based offset into the COMPRESSED stream the error is about, or
 // `-1` when it is not about a place in the stream.
@@ -171,7 +173,24 @@ impl Error for FlateError
 //     println("${flateerror.offset_of(BadLevel(11))}")        // -1
 // ```
 pub fn offset_of(e: FlateError) -> Int
-    todo("flate-nv.offset_of")
+    match e
+        BadStoredLength(o, _, _)     => o
+        BadBlockType(o)              => o
+        BadHuffmanCode(o)            => o
+        IncompleteHuffmanTable(o, _) => o
+        BadDistance(o, _, _)         => o
+        TruncatedStream(o)           => o
+        BadZlibHeader(o, _, _)       => o
+        ZlibDictionaryRequired(o, _) => o
+        BadGzipMagic(o, _)           => o
+        BadGzipMethod(o, _)          => o
+        BadGzipHeaderCrc(o, _, _)    => o
+        ChecksumMismatch(o, _, _)    => o
+        GzipLengthMismatch(o, _, _)  => o
+        TrailingGarbage(o)           => o
+        OutputTooLarge(o, _)         => o
+        BadLevel(_)                  => -1
+        SourceFailed(_)              => -1
 
 // Whether this error means the bytes are damaged, as opposed to
 // missing or unsupported.
@@ -192,4 +211,29 @@ pub fn offset_of(e: FlateError) -> Int
 //         println("damaged")                                  // this one
 // ```
 pub fn is_corrupt(e: FlateError) -> Bool
-    todo("flate-nv.is_corrupt")
+    match e
+        TruncatedStream(_) => false
+        SourceFailed(_)    => false
+        _                  => true
+
+// The reason a variant stands for, as a sentence fragment with its
+// numbers in it and without the position.
+fn reason_of(e: FlateError) -> Str
+    match e
+        BadStoredLength(_, len, nlen)       => "stored block length ${len} does not match its complement ${nlen}"
+        BadBlockType(_)                     => "reserved block type 3"
+        BadHuffmanCode(_)                   => "a code that is not in the Huffman table"
+        IncompleteHuffmanTable(_, symbol)   => "the Huffman table does not describe a complete code, first at symbol ${symbol}"
+        BadDistance(_, distance, available) => "a back-reference of ${distance} bytes with only ${available} produced"
+        TruncatedStream(_)                  => "the stream ends inside a block, a header or a trailer"
+        BadZlibHeader(_, cmf, flg)          => "not a zlib header: CMF ${cmf}, FLG ${flg}"
+        ZlibDictionaryRequired(_, id)       => "the stream needs the preset dictionary with Adler-32 ${id}"
+        BadGzipMagic(_, saw)                => "not a gzip member: the first two bytes are ${saw}"
+        BadGzipMethod(_, method)            => "gzip compression method ${method} is not 8"
+        BadGzipHeaderCrc(_, want, got)      => "gzip header CRC16 is ${want}, computed ${got}"
+        ChecksumMismatch(_, want, got)      => "checksum is ${want}, computed ${got}"
+        GzipLengthMismatch(_, want, got)    => "gzip length is ${want}, produced ${got} modulo 2^32"
+        TrailingGarbage(_)                  => "bytes after the end of the stream"
+        OutputTooLarge(_, cap)              => "the output exceeds the limit of ${cap} bytes"
+        BadLevel(n)                         => "compression level ${n} is outside 0 to 9"
+        SourceFailed(c)                     => "the source failed: ${c.message()}"

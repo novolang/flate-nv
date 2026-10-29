@@ -1,0 +1,51 @@
+// flateerror_tests.nv — the message, the offset and the retry question
+// of every reason a stream can be refused.
+
+use std.test
+use flateerror
+
+fn every_error() -> [FlateError]
+    [BadStoredLength(10, 5, 7), BadBlockType(11), BadHuffmanCode(12),
+     IncompleteHuffmanTable(13, 256), BadDistance(14, 300, 200),
+     TruncatedStream(15), BadZlibHeader(16, 120, 0),
+     ZlibDictionaryRequired(17, 99), BadGzipMagic(18, 20555),
+     BadGzipMethod(19, 7), BadGzipHeaderCrc(20, 1, 2),
+     ChecksumMismatch(21, 3, 4), GzipLengthMismatch(22, 5, 6),
+     TrailingGarbage(23), OutputTooLarge(24, 100), BadLevel(11),
+     SourceFailed(IoClosed)]
+
+@test
+fn test_every_reason_has_a_message() [io]
+    for e in every_error()
+        test.case("${flateerror.offset_of(e)}")
+        test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_a_positional_message_starts_with_its_offset() [io]
+    test.assert_eq_str(BadBlockType(64).message(), "at byte 64: reserved block type 3")
+    test.assert(str.starts_with(TruncatedStream(9).message(), "at byte 9: "))
+    test.assert(str.contains(BadDistance(1, 300, 200).message(), "300"))
+    test.assert(str.contains(BadDistance(1, 300, 200).message(), "200"))
+
+@test
+fn test_a_message_without_a_place_has_no_offset() [io]
+    test.assert(str.starts_with(BadLevel(11).message(), "compression level 11"))
+    test.assert(str.contains(SourceFailed(IoClosed).message(), "closed"))
+
+@test
+fn test_offsets_are_the_places_the_variants_carry() [io]
+    var expect = 10
+    for e in every_error()
+        if expect <= 24
+            test.assert(flateerror.offset_of(e) == expect)
+        expect = expect + 1
+    test.assert(flateerror.offset_of(BadLevel(3)) == -1)
+    test.assert(flateerror.offset_of(SourceFailed(IoClosed)) == -1)
+
+@test
+fn test_only_missing_bytes_are_not_corruption() [io]
+    var kept = 0
+    for e in every_error()
+        if not flateerror.is_corrupt(e)
+            kept = kept + 1
+    test.assert(kept == 2)
