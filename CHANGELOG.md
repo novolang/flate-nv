@@ -5,6 +5,12 @@ All notable changes to flate-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 — 2026-10-30
+
+### Fixed
+
+- The inflate cursor struct is named `InflateCursor` instead of `Cursor`. A private struct called `Cursor` made the compiler withhold `std.bytes.Cursor` from every package that depends on flate-nv, which broke the build of arrow-nv and parquet-nv. No public signature changed.
+
 ## 0.1.0 — 2026-10-29
 
 First implementation of the interface published as 0.0.4. Every function has a body, the package is `experimental`, and the floor is toolchain 0.22.0.

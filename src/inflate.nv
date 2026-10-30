@@ -518,7 +518,7 @@ const WINDOW_SIZE = 32768
 // The work of one `feed`: the input in hand, the output being built and
 // the decoder's registers, all writable so that the steps below can
 // advance them in place.  `settle` turns it back into an `Inflater`.
-struct Cursor
+struct InflateCursor
     src: Bytes
     var n: Int
     var ip: Int
@@ -553,12 +553,12 @@ fn failed(d: Inflater, e: FlateError) -> Inflater
 //
 // The history buffer starts as the window and has room for the output
 // that is likely to follow; `room` makes more when it is not enough.
-fn open_cursor(d: Inflater, src: Bytes) -> Cursor
+fn open_cursor(d: Inflater, src: Bytes) -> InflateCursor
     let wlen = bytes.len(d.window)
     let n = bytes.len(src)
     var hist = bytes.zeros(wlen + 4 * n + 1024)
     bytes.copy_into(hist, 0, d.window, 0, wlen)
-    Cursor { src: src, n: n, ip: 0, base: d.consumed, bb: d.bit_buf,
+    InflateCursor { src: src, n: n, ip: 0, base: d.consumed, bb: d.bit_buf,
              bc: d.bit_count, state: d.state, final_block: d.final_block,
              stored_left: d.stored_left, lit_code: d.lit_code,
              dist_code: d.dist_code, hist: hist, hlen: wlen, start: wlen,
@@ -573,7 +573,7 @@ fn open_cursor(d: Inflater, src: Bytes) -> Cursor
 // input, so that the next chunk reads them again and the buffer holds
 // only the bits of a partly used byte.  Once the stream has ended the
 // bytes after it are not kept: they are not this decoder's.
-fn settle(d: Inflater, var c: Cursor) -> (Inflater, Bytes)
+fn settle(d: Inflater, var c: InflateCursor) -> (Inflater, Bytes)
     fold_check(var c)
     let back = c.bc / 8
     c.ip = c.ip - back
@@ -616,7 +616,7 @@ fn min_int(a: Int, b: Int) -> Int
 
 // Run the machine until it needs more input, fails or reaches the end
 // of the stream.
-fn drain(var c: Cursor)
+fn drain(var c: InflateCursor)
     var running = true
     while running
         if c.failure != None or c.state == STATE_DONE
@@ -626,7 +626,7 @@ fn drain(var c: Cursor)
 
 // One step of the machine.  Answers whether it made progress, which is
 // false when it needs more input than the cursor holds.
-fn step(var c: Cursor) -> Bool
+fn step(var c: InflateCursor) -> Bool
     if c.state == STATE_HEADER
         return step_header(var c)
     if c.state == STATE_BLOCK
@@ -643,18 +643,18 @@ fn step(var c: Cursor) -> Bool
 
 // The offset in the compressed stream of the byte holding the next
 // bit.
-fn here(c: Cursor) -> Int
+fn here(c: InflateCursor) -> Int
     c.base + c.ip - (c.bc + 7) / 8
 
 // Record a failure.  Always answers false so that a step can end with
 // it.
-fn fail(var c: Cursor, e: FlateError) -> Bool
+fn fail(var c: InflateCursor, e: FlateError) -> Bool
     c.failure = Some(e)
     false
 
 // Pull bytes into the bit buffer until it holds `n` bits, or the input
 // runs out.  Answers whether it holds them.  `n` is at most 48.
-fn avail(var c: Cursor, n: Int) -> Bool
+fn avail(var c: InflateCursor, n: Int) -> Bool
     while c.bc < n and c.ip < c.n
         c.bb = c.bb | ((bytes.byte_at(c.src, c.ip) ?? 0) << c.bc)
         c.bc = c.bc + 8
@@ -662,7 +662,7 @@ fn avail(var c: Cursor, n: Int) -> Bool
     c.bc >= n
 
 // Fill the bit buffer as far as the input allows.
-fn refill(var c: Cursor)
+fn refill(var c: InflateCursor)
     while c.bc <= 48 and c.ip < c.n
         c.bb = c.bb | ((bytes.byte_at(c.src, c.ip) ?? 0) << c.bc)
         c.bc = c.bc + 8
@@ -670,7 +670,7 @@ fn refill(var c: Cursor)
 
 // Remove `n` bits from the bit buffer and answer them.  The buffer
 // must hold them.
-fn take(var c: Cursor, n: Int) -> Int
+fn take(var c: InflateCursor, n: Int) -> Int
     let v = c.bb & ((1 << n) - 1)
     c.bb = c.bb >>> n
     c.bc = c.bc - n
@@ -679,14 +679,14 @@ fn take(var c: Cursor, n: Int) -> Int
 // Drop the bits left in a partly used byte, and hand every whole byte
 // in the bit buffer back to the input, so that the next read is byte
 // aligned and starts at `ip`.
-fn align(var c: Cursor)
+fn align(var c: InflateCursor)
     c.ip = c.ip - c.bc / 8
     c.bb = 0
     c.bc = 0
 
 // Make room for `k` more bytes of output.  Answers false, with the
 // failure recorded, when that would pass the limit.
-fn room(var c: Cursor, k: Int) -> Bool
+fn room(var c: InflateCursor, k: Int) -> Bool
     if c.limit >= 0 and c.outbase + c.hlen + k > c.limit
         return fail(var c, OutputTooLarge(here(c), c.limit))
     if c.hlen + k > bytes.len(c.hist)
@@ -697,7 +697,7 @@ fn room(var c: Cursor, k: Int) -> Bool
 
 // Fold the output produced since the last call into the container's
 // check.
-fn fold_check(var c: Cursor)
+fn fold_check(var c: InflateCursor)
     if c.hlen > c.checked
         let seg = bytes.slice(c.hist, c.checked, c.hlen)
         match c.format
@@ -713,7 +713,7 @@ fn fold_check(var c: Cursor)
 
 // The container header.  It is read from the start of the input, which
 // is where the input starts for as long as the machine is in this state.
-fn step_header(var c: Cursor) -> Bool
+fn step_header(var c: InflateCursor) -> Bool
     match c.format
         RawDeflate  =>
             c.state = STATE_BLOCK
@@ -740,7 +740,7 @@ fn step_header(var c: Cursor) -> Bool
                 Err(e)                  => fail(var c, e)
 
 // A block header: the final flag and the two bits of the type.
-fn step_block(var c: Cursor) -> Bool
+fn step_block(var c: InflateCursor) -> Bool
     if not avail(var c, 3)
         return false
     let at = here(c)
@@ -762,7 +762,7 @@ fn step_block(var c: Cursor) -> Bool
     fail(var c, BadBlockType(at))
 
 // The length of a stored block and its complement.
-fn step_stored_head(var c: Cursor) -> Bool
+fn step_stored_head(var c: InflateCursor) -> Bool
     if c.n - c.ip < 4
         return false
     let len = bytes.u16_le_at(c.src, c.ip) ?? 0
@@ -775,7 +775,7 @@ fn step_stored_head(var c: Cursor) -> Bool
     true
 
 // The bytes of a stored block, as many as the input holds.
-fn step_stored(var c: Cursor) -> Bool
+fn step_stored(var c: InflateCursor) -> Bool
     if c.stored_left > 0
         let k = min_int(c.stored_left, c.n - c.ip)
         if k == 0
@@ -792,7 +792,7 @@ fn step_stored(var c: Cursor) -> Bool
     true
 
 // The end of a block: the next block header, or the trailer.
-fn end_block(var c: Cursor)
+fn end_block(var c: InflateCursor)
     if not c.final_block
         c.state = STATE_BLOCK
         return
@@ -809,7 +809,7 @@ fn end_block(var c: Cursor)
 // coded by it.  The header is read whole or not at all, so that a chunk
 // boundary inside it costs a second read of the header and not a state
 // of its own.
-fn step_dynamic(var c: Cursor) -> Bool
+fn step_dynamic(var c: InflateCursor) -> Bool
     let saved_bb = c.bb
     let saved_bc = c.bc
     let saved_ip = c.ip
@@ -880,14 +880,14 @@ fn step_dynamic(var c: Cursor) -> Bool
 
 // Undo what a step read, because the input ended inside it.  Always
 // false.
-fn rewind(var c: Cursor, bb: Int, bc: Int, ip: Int) -> Bool
+fn rewind(var c: InflateCursor, bb: Int, bc: Int, ip: Int) -> Bool
     c.bb = bb
     c.bc = bc
     c.ip = ip
     false
 
 // Remove `n` bits already known to be present.
-fn discard(var c: Cursor, n: Int)
+fn discard(var c: InflateCursor, n: Int)
     c.bb = c.bb >>> n
     c.bc = c.bc - n
 
@@ -900,14 +900,14 @@ const CODE_STOP = 2
 // The codes of a block: literals, back-references and the end of the
 // block.  A code whose bits are not all in hand is left for the next
 // chunk, with the bit buffer put back as it was before the code.
-fn step_codes(var c: Cursor) -> Bool
+fn step_codes(var c: InflateCursor) -> Bool
     var status = CODE_MORE
     while status == CODE_MORE
         status = one_code(var c)
     status == CODE_END
 
 // One literal, one back-reference or the end of the block.
-fn one_code(var c: Cursor) -> Int
+fn one_code(var c: InflateCursor) -> Int
     refill(var c)
     let saved_bb = c.bb
     let saved_bc = c.bc
@@ -936,7 +936,7 @@ fn one_code(var c: Cursor) -> Int
 // A length and distance pair whose length code is `code`.  Answers
 // false when the input ends inside the pair, in which case the bit
 // buffer is put back to `bb` and `bc`, or when the pair is invalid.
-fn step_match(var c: Cursor, code: Int, bb: Int, bc: Int) -> Bool
+fn step_match(var c: InflateCursor, code: Int, bb: Int, bc: Int) -> Bool
     if code > 28
         return fail(var c, BadHuffmanCode(here(c)))
     let lextra = flatehuff.len_extra(code)
@@ -970,7 +970,7 @@ fn step_match(var c: Cursor, code: Int, bb: Int, bc: Int) -> Bool
     true
 
 // The trailer: the check of the plaintext, and for gzip its length.
-fn step_trailer(var c: Cursor) -> Bool
+fn step_trailer(var c: InflateCursor) -> Bool
     align(var c)
     fold_check(var c)
     match c.format
